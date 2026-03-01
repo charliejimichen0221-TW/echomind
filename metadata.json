@@ -1,0 +1,7 @@
+{
+  "name": "EchoMind: Pure Listening",
+  "description": "An AI-powered English vocabulary trainer that focuses purely on auditory memory and pronunciation, powered by Gemini Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

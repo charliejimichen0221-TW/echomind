@@ -1,0 +1,9 @@
+node_modules/
+praat/Praat.exe
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
