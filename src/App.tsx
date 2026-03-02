@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, Send, MessageSquare, Shield, Zap, Info, History, X, User, Headphones, BookOpen, CheckCircle2, Award, Activity, BarChart3, Volume2, AudioLines } from 'lucide-react';
+import { Mic, MicOff, Send, MessageSquare, Shield, Zap, Info, History, X, User, Headphones, BookOpen, CheckCircle2, Award, Activity, BarChart3, Volume2, AudioLines, Play, Square } from 'lucide-react';
 import { useLiveAPI } from './hooks/useLiveAPI';
 import { AudioVisualizer } from './components/AudioVisualizer';
 import { TalkingHead } from './components/TalkingHead';
@@ -15,7 +15,7 @@ const TRAINING_LEVELS = [
 ];
 
 export default function App() {
-  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord } = useLiveAPI();
+  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord, pauseAI, resumeAI } = useLiveAPI();
   const [selectedLevel, setSelectedLevel] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [debaterImage, setDebaterImage] = useState<string | null>(null);
@@ -24,6 +24,50 @@ export default function App() {
   const [showDashboard, setShowDashboard] = useState(false);
   const startTimeRef = useRef<number>(0);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // ── Audio Playback State ──
+  const refAudioRef = useRef<HTMLAudioElement | null>(null);
+  const userAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [playingAudio, setPlayingAudio] = useState<'ref' | 'user' | null>(null);
+
+  const stopAllPlayback = useCallback(() => {
+    if (refAudioRef.current) { refAudioRef.current.pause(); refAudioRef.current.currentTime = 0; }
+    if (userAudioRef.current) { userAudioRef.current.pause(); userAudioRef.current.currentTime = 0; }
+    setPlayingAudio(null);
+    // Resume AI speech and mic buffering
+    resumeAI();
+  }, [resumeAI]);
+
+  const playAudio = useCallback((type: 'ref' | 'user', timestamp?: number) => {
+    stopAllPlayback();
+
+    // Pause AI speech and mic buffering to prevent feedback
+    pauseAI();
+
+    const url = `/api/audio/${type}?t=${timestamp || Date.now()}`;
+    const audio = new Audio(url);
+
+    audio.onended = () => {
+      setPlayingAudio(null);
+      resumeAI();
+    };
+    audio.onerror = () => {
+      setPlayingAudio(null);
+      resumeAI();
+    };
+
+    if (type === 'ref') {
+      refAudioRef.current = audio;
+    } else {
+      userAudioRef.current = audio;
+    }
+
+    audio.play().catch(() => {
+      setPlayingAudio(null);
+      resumeAI();
+    });
+    setPlayingAudio(type);
+  }, [stopAllPlayback, pauseAI, resumeAI]);
 
   // Fetch initial progress
   useEffect(() => {
@@ -603,13 +647,85 @@ export default function App() {
                                 </div>
                               )}
 
+                              {/* ── Audio Playback Comparison ── */}
+                              <div className="mb-5 p-4 rounded-xl bg-zinc-800/50 border border-white/5">
+                                <p className="text-[9px] uppercase tracking-[0.2em] font-bold text-zinc-500 mb-3">Compare Audio</p>
+                                <div className="flex gap-3">
+                                  {/* AI Reference Button */}
+                                  <button
+                                    onClick={() => playingAudio === 'ref' ? stopAllPlayback() : playAudio('ref', pronunciationScore.comparison?.audioTimestamp)}
+                                    className={cn(
+                                      "flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border transition-all duration-300",
+                                      playingAudio === 'ref'
+                                        ? "bg-blue-500/15 border-blue-500/40 text-blue-300 shadow-[0_0_12px_rgba(59,130,246,0.15)]"
+                                        : "bg-zinc-900/80 border-white/5 text-zinc-400 hover:border-blue-500/30 hover:text-blue-400 hover:bg-blue-500/5"
+                                    )}
+                                  >
+                                    {playingAudio === 'ref' ? (
+                                      <>
+                                        <Square className="w-3 h-3 fill-current" />
+                                        <span className="text-[10px] font-bold uppercase tracking-wider">Playing...</span>
+                                        <span className="flex gap-0.5">
+                                          {[0.3, 0.5, 0.7, 0.5, 0.3].map((h, i) => (
+                                            <motion.span
+                                              key={i}
+                                              animate={{ scaleY: [1, h * 3, 1] }}
+                                              transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.1 }}
+                                              className="w-0.5 h-2.5 bg-blue-400 rounded-full origin-bottom"
+                                            />
+                                          ))}
+                                        </span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Play className="w-3 h-3" />
+                                        <span className="text-[10px] font-bold uppercase tracking-wider">AI Reference</span>
+                                      </>
+                                    )}
+                                  </button>
+
+                                  {/* User Recording Button */}
+                                  <button
+                                    onClick={() => playingAudio === 'user' ? stopAllPlayback() : playAudio('user', pronunciationScore.comparison?.audioTimestamp)}
+                                    className={cn(
+                                      "flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl border transition-all duration-300",
+                                      playingAudio === 'user'
+                                        ? "bg-amber-500/15 border-amber-500/40 text-amber-300 shadow-[0_0_12px_rgba(245,158,11,0.15)]"
+                                        : "bg-zinc-900/80 border-white/5 text-zinc-400 hover:border-amber-500/30 hover:text-amber-400 hover:bg-amber-500/5"
+                                    )}
+                                  >
+                                    {playingAudio === 'user' ? (
+                                      <>
+                                        <Square className="w-3 h-3 fill-current" />
+                                        <span className="text-[10px] font-bold uppercase tracking-wider">Playing...</span>
+                                        <span className="flex gap-0.5">
+                                          {[0.3, 0.5, 0.7, 0.5, 0.3].map((h, i) => (
+                                            <motion.span
+                                              key={i}
+                                              animate={{ scaleY: [1, h * 3, 1] }}
+                                              transition={{ duration: 0.5, repeat: Infinity, delay: i * 0.1 }}
+                                              className="w-0.5 h-2.5 bg-amber-400 rounded-full origin-bottom"
+                                            />
+                                          ))}
+                                        </span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Play className="w-3 h-3" />
+                                        <span className="text-[10px] font-bold uppercase tracking-wider">Your Speech</span>
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
+                              </div>
+
                               {/* Comparison Metrics */}
                               <div className="space-y-2.5 mb-4">
                                 {[
-                                  { label: 'Pitch Pattern', value: Math.max(0, Math.round(pronunciationScore.comparison.pitchCorrelation * 100)), color: 'blue' },
-                                  { label: 'Vowel Match', value: Math.round((pronunciationScore.comparison.f1Similarity + pronunciationScore.comparison.f2Similarity) / 2), color: 'violet' },
-                                  { label: 'Speaking Pace', value: Math.max(0, Math.round(100 - Math.abs(pronunciationScore.comparison.durationRatio - 1) * 100)), color: 'emerald' },
-                                  { label: 'Stress Pattern', value: Math.max(0, Math.round(pronunciationScore.comparison.intensityCorrelation * 100)), color: 'amber' },
+                                  { label: 'Pitch Pattern', value: pronunciationScore.comparison.pitchScore, color: 'blue' },
+                                  { label: 'Vowel Match', value: pronunciationScore.comparison.formantScore, color: 'violet' },
+                                  { label: 'Speaking Pace', value: pronunciationScore.comparison.durationScore, color: 'emerald' },
+                                  { label: 'Stress Pattern', value: pronunciationScore.comparison.intensityScore, color: 'amber' },
                                 ].map(({ label, value, color }) => (
                                   <div key={label} className="flex items-center gap-3">
                                     <span className="text-[10px] text-zinc-400 font-medium w-24 shrink-0 uppercase tracking-wider">{label}</span>

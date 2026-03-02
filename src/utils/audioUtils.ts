@@ -18,6 +18,7 @@ export class AudioProcessor {
   private processor: ScriptProcessorNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private isBuffering = false;
+  private isMuted = false;  // When true, stops ALL audio output (to Gemini AND buffer)
   private userBuffer: string[] = [];
   private aiBuffer: string[] = [];
 
@@ -31,6 +32,9 @@ export class AudioProcessor {
     this.processor.connect(this.audioContext.destination);
 
     this.processor.onaudioprocess = (e) => {
+      // When muted, skip everything — no audio goes to Gemini or buffer
+      if (this.isMuted) return;
+
       const float32 = e.inputBuffer.getChannelData(0);
       const pcm16 = this.float32ToPCM16(float32);
       const base64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)));
@@ -53,6 +57,8 @@ export class AudioProcessor {
 
   // ── Buffering control ──
   setBuffering(on: boolean) { this.isBuffering = on; }
+  // ── Mute control (stops ALL audio: Gemini + buffer) ──
+  setMuted(muted: boolean) { this.isMuted = muted; }
   hasUserAudio(): boolean { return this.userBuffer.length > 0; }
   clearUserBuffer() { this.userBuffer = []; }
   flushUserBuffer(): string[] { const b = [...this.userBuffer]; this.userBuffer = []; return b; }
@@ -118,6 +124,25 @@ export class AudioPlayer {
     this.ctx = new AudioContext({ sampleRate: 24000 });
     this.nextTime = 0;
     this.onVolume?.(0);
+  }
+
+  /** Suspend playback (pauses all scheduled audio) */
+  async suspend() {
+    if (this.ctx.state === 'running') {
+      await this.ctx.suspend();
+      this.onVolume?.(0);
+    }
+  }
+
+  /** Resume playback after suspend */
+  async resume() {
+    if (this.ctx.state === 'suspended') {
+      await this.ctx.resume();
+    }
+  }
+
+  get isPlaying(): boolean {
+    return this.ctx.state === 'running' && this.nextTime > this.ctx.currentTime;
   }
 
   private decodePCM16(base64: string): Float32Array {

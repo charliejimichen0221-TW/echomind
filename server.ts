@@ -3,6 +3,7 @@ import cors from 'cors';
 import bodyParser from 'body-parser';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import fs from 'fs';
 import { analyzePronunciation, comparePronunciation } from './praatService.js';
 
 const app = express();
@@ -99,6 +100,30 @@ app.post('/api/score', (req, res) => {
     record: userProgress[word.toLowerCase()],
     calculatedScore: newScore
   });
+});
+
+// ===== Serve comparison audio files =====
+// These are the aligned audio segments that Praat actually compared
+app.get('/api/audio/ref', (req, res) => {
+  const filePath = path.join(process.cwd(), 'debug', 'ref_recording.wav');
+  if (fs.existsSync(filePath)) {
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(filePath);
+  } else {
+    res.status(404).json({ error: 'Reference audio not available' });
+  }
+});
+
+app.get('/api/audio/user', (req, res) => {
+  const filePath = path.join(process.cwd(), 'debug', 'user_recording.wav');
+  if (fs.existsSync(filePath)) {
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(filePath);
+  } else {
+    res.status(404).json({ error: 'User audio not available' });
+  }
 });
 
 // ===== Praat Pronunciation Analysis =====

@@ -24,10 +24,17 @@ export interface ComparisonResult {
   f2Similarity: number;
   intensityCorrelation: number;
   overallSimilarity: number;
+  // Pre-computed sub-scores (0-100)
+  mfccScore: number;
+  pitchScore: number;
+  durationScore: number;
+  formantScore: number;
+  intensityScore: number;
   ref: { meanPitch: number; f1: number; f2: number; duration: number; meanIntensity: number };
   user: { meanPitch: number; f1: number; f2: number; duration: number; meanIntensity: number };
   pitchContour: { ref: number[]; user: number[] };
   feedback: string[];
+  audioTimestamp?: number;
 }
 
 // ═══════════════════════════════════════════════
@@ -492,9 +499,31 @@ export function useLiveAPI() {
     setIsSpeaking(false);
   }, []);
 
+  // ── Buffering control for external use (e.g., audio playback) ──
+  const setBuffering = useCallback((on: boolean) => {
+    processorRef.current?.setBuffering(on);
+  }, []);
+
+  // ── AI playback control (pause/resume when user plays comparison audio) ──
+  const pauseAI = useCallback(async () => {
+    // Mute mic completely — prevents playback audio from reaching Gemini
+    processorRef.current?.setMuted(true);
+    processorRef.current?.setBuffering(false);
+    // Pause AI speech
+    await playerRef.current?.suspend();
+  }, []);
+
+  const resumeAI = useCallback(async () => {
+    // Unmute mic and resume buffering
+    processorRef.current?.setMuted(false);
+    processorRef.current?.setBuffering(true);
+    // Resume AI speech
+    await playerRef.current?.resume();
+  }, []);
+
   return {
     isConnected, isListening, isSpeaking, volume, transcript, error,
     pronunciationScore, isAnalyzing, currentTargetWord,
-    connect, disconnect,
+    connect, disconnect, setBuffering, pauseAI, resumeAI,
   };
 }

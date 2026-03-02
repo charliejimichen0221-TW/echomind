@@ -14,6 +14,7 @@ const PRAAT_EXE = path.join(process.cwd(), 'praat', 'Praat.exe');
 const PRAAT_SCRIPT = path.join(process.cwd(), 'praat', 'analyze.praat');
 const PRAAT_COMPARE_SCRIPT = path.join(process.cwd(), 'praat', 'compare.praat');
 const ALIGN_SCRIPT = path.join(process.cwd(), 'praat', 'align.py');
+const MFCC_DTW_SCRIPT = path.join(process.cwd(), 'praat', 'mfcc_dtw.py');
 
 /**
  * Use Whisper to find the target word's start/end timestamps in a WAV file.
@@ -85,10 +86,17 @@ export interface ComparisonResult {
   f2Similarity: number;          // 0-100%
   intensityCorrelation: number;  // -1 to 1
   overallSimilarity: number;     // 0-100 weighted
+  // Pre-computed sub-scores (0-100) for frontend display
+  mfccScore: number;
+  pitchScore: number;
+  durationScore: number;
+  formantScore: number;
+  intensityScore: number;
   ref: { meanPitch: number; f1: number; f2: number; duration: number; meanIntensity: number };
   user: { meanPitch: number; f1: number; f2: number; duration: number; meanIntensity: number };
   pitchContour: { ref: number[]; user: number[] };  // for visualization
   feedback: string[];
+  audioTimestamp?: number;  // cache-busting timestamp for audio playback URLs
 }
 
 /**
@@ -425,6 +433,60 @@ function createEmptyScore(message: string): PronunciationScore {
 }
 
 /**
+ * Normalize a WAV buffer for playback:
+ * 1. Resample to 16kHz (consistent rate for both ref & user)
+ * 2. Peak-normalize loudness (both clips reach same max volume)
+ */
+function normalizeWavForPlayback(wavBuffer: Buffer, originalRate: number): Buffer {
+  const headerSize = 44;
+  const targetRate = 16000;
+
+  // Extract PCM data (skip WAV header)
+  const pcmData = wavBuffer.slice(headerSize);
+  const samples = new Int16Array(
+    pcmData.buffer,
+    pcmData.byteOffset,
+    pcmData.length / 2
+  );
+
+  let resampled: Int16Array;
+
+  if (originalRate !== targetRate) {
+    // Simple linear interpolation resampling
+    const ratio = originalRate / targetRate;
+    const newLen = Math.floor(samples.length / ratio);
+    resampled = new Int16Array(newLen);
+    for (let i = 0; i < newLen; i++) {
+      const srcIdx = i * ratio;
+      const lo = Math.floor(srcIdx);
+      const hi = Math.min(lo + 1, samples.length - 1);
+      const frac = srcIdx - lo;
+      resampled[i] = Math.round(samples[lo] * (1 - frac) + samples[hi] * frac);
+    }
+  } else {
+    resampled = new Int16Array(samples);
+  }
+
+  // Peak normalization — scale so the loudest sample reaches 90% of max (avoid clipping)
+  let maxAmp = 0;
+  for (let i = 0; i < resampled.length; i++) {
+    const a = Math.abs(resampled[i]);
+    if (a > maxAmp) maxAmp = a;
+  }
+
+  if (maxAmp > 0 && maxAmp < 29000) {
+    const scale = 29000 / maxAmp; // ~88% of 32768
+    for (let i = 0; i < resampled.length; i++) {
+      resampled[i] = Math.round(Math.max(-32768, Math.min(32767, resampled[i] * scale)));
+    }
+  }
+
+  // Convert back to WAV
+  const pcmBuf = Buffer.from(resampled.buffer, resampled.byteOffset, resampled.byteLength);
+  return pcmToWav(pcmBuf, targetRate);
+}
+
+/**
  * Compare user pronunciation against AI reference audio
  */
 export async function comparePronunciation(
@@ -479,6 +541,7 @@ export async function comparePronunciation(
     ]);
 
     // ALWAYS align ref — AI speech is clear, Whisper is reliable
+    // Note: align.py already adds dynamic padding (150-600ms), no extra padding needed here
     if (refAlign.found && refAlign.start !== undefined && refAlign.end !== undefined) {
       const refSeg = extractWavSegment(fullRefWav, AI_OUTPUT_RATE, refAlign.start, refAlign.end);
       refWavPath = path.join(tmpDir, `echomind_ref_aligned_${ts}.wav`);
@@ -489,6 +552,7 @@ export async function comparePronunciation(
     }
 
     // Align user if possible — user speech may be unclear
+    // Note: align.py already adds dynamic padding (150-600ms), no extra padding needed here
     if (userAlign.found && userAlign.start !== undefined && userAlign.end !== undefined) {
       const userSeg = extractWavSegment(fullUserWav, sampleRate, userAlign.start, userAlign.end);
       userWavPath = path.join(tmpDir, `echomind_user_aligned_${ts}.wav`);
@@ -504,51 +568,80 @@ export async function comparePronunciation(
     }
   }
 
-  // Save debug copies (after alignment — so debug files show what Praat actually compares)
+  // Save debug copies (after alignment — normalized for fair playback comparison)
   const debugDir = path.join(process.cwd(), 'debug');
   if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
-  fs.copyFileSync(refWavPath, path.join(debugDir, 'ref_recording.wav'));
-  fs.copyFileSync(userWavPath, path.join(debugDir, 'user_recording.wav'));
+
+  // Normalize both to 16kHz and peak-normalize loudness for fair playback comparison
+  const refNorm = normalizeWavForPlayback(fs.readFileSync(refWavPath), AI_OUTPUT_RATE);
+  const userNorm = normalizeWavForPlayback(fs.readFileSync(userWavPath), sampleRate);
+  fs.writeFileSync(path.join(debugDir, 'ref_recording.wav'), refNorm);
+  fs.writeFileSync(path.join(debugDir, 'user_recording.wav'), userNorm);
+
   // Also save full (pre-alignment) copies for inspection
   fs.copyFileSync(fullRefWavPath, path.join(debugDir, 'ref_full.wav'));
   fs.copyFileSync(fullUserWavPath, path.join(debugDir, 'user_full.wav'));
-  console.log(`[PraatService] 🐛 Debug files saved (aligned + full)`);
+  console.log(`[PraatService] 🐛 Debug files saved (aligned + normalized to 16kHz)`);
 
   try {
-    console.log('[PraatService] 🔬 Running Praat comparison...');
+    console.log('[PraatService] 🔬 Running Praat + MFCC-DTW comparison...');
     const startTime = Date.now();
 
-    const result = await new Promise<any>((resolve, reject) => {
-      execFile(
-        PRAAT_EXE,
-        ['--run', '--utf8', PRAAT_COMPARE_SCRIPT, refWavPath, userWavPath],
-        { timeout: 30000, maxBuffer: 1024 * 512 },
-        (error, stdout, stderr) => {
-          if (error) {
-            console.error('[PraatService] Compare error:', error.message);
-            console.error('[PraatService] stderr:', stderr);
-            reject(error);
-            return;
+    // Run Praat and MFCC-DTW in parallel for zero extra latency
+    const [praatResult, dtwResult] = await Promise.all([
+      // Praat: pitch, formant, intensity, duration
+      new Promise<any>((resolve, reject) => {
+        execFile(
+          PRAAT_EXE,
+          ['--run', '--utf8', PRAAT_COMPARE_SCRIPT, refWavPath, userWavPath],
+          { timeout: 30000, maxBuffer: 1024 * 512 },
+          (error, stdout, stderr) => {
+            if (error) {
+              console.error('[PraatService] Compare error:', error.message);
+              reject(error);
+              return;
+            }
+            try {
+              resolve(JSON.parse(stdout.toString().trim()));
+            } catch (e) {
+              console.error('[PraatService] Failed to parse compare output:', stdout);
+              reject(e);
+            }
           }
-          try {
-            const parsed = JSON.parse(stdout.toString().trim());
-            resolve(parsed);
-          } catch (e) {
-            console.error('[PraatService] Failed to parse compare output:', stdout);
-            reject(e);
+        );
+      }),
+      // Python MFCC-DTW: spectral similarity distance
+      new Promise<any>((resolve) => {
+        execFile(
+          'python', [MFCC_DTW_SCRIPT, refWavPath, userWavPath],
+          { timeout: 30000, maxBuffer: 1024 * 512 },
+          (error, stdout) => {
+            if (error) {
+              console.warn('[PraatService] ⚠️ MFCC-DTW failed:', error.message);
+              resolve({ distance: 999 });
+              return;
+            }
+            try {
+              resolve(JSON.parse(stdout.toString().trim()));
+            } catch {
+              resolve({ distance: 999 });
+            }
           }
-        }
-      );
-    });
+        );
+      }),
+    ]);
+
+    // Merge DTW distance into Praat result
+    const result = { ...praatResult, dtwDistance: dtwResult.distance ?? 999 };
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log(`[PraatService] ✅ Comparison completed in ${elapsed}s`);
+    console.log(`[PraatService] 📊 MFCC-DTW distance: ${result.dtwDistance}`);
     console.log(`[PraatService] 📊 Pitch correlation: ${result.pitchCorrelation}`);
     console.log(`[PraatService] 📊 Duration ratio: ${result.durationRatio}`);
     console.log(`[PraatService] 📊 F1 similarity: ${result.f1Similarity}% | F2 similarity: ${result.f2Similarity}%`);
     console.log(`[PraatService] 📊 Intensity correlation: ${result.intensityCorrelation}`);
 
-    // Compute overall similarity and generate feedback
     return computeComparison(result);
   } catch (err) {
     console.error('[PraatService] ❌ Comparison failed:', err);
@@ -564,61 +657,74 @@ export async function comparePronunciation(
 function computeComparison(raw: any): ComparisonResult {
   const feedback: string[] = [];
 
-  // Log DTW distance if available
-  if (raw.dtwDistance !== undefined) {
-    console.log(`[PraatService] 📊 DTW distance: ${raw.dtwDistance} (lower = more similar)`);
-  }
+  // ── MFCC-DTW distance → score (40% weight — core "does it sound like the same word?") ──
+  // DTW distance: 0 = identical, ~15 = similar, ~40+ = very different
+  const dtwDist = raw.dtwDistance ?? 999;
+  const mfccScore = dtwDist < 900 ? Math.max(0, Math.round(100 * Math.exp(-dtwDist / 25))) : 0;
+  console.log(`[PraatService] 📊 MFCC-DTW: dist=${dtwDist.toFixed(2)} → score=${mfccScore}/100`);
 
-  // Pitch contour similarity (40% weight)
-  const pitchScore = Math.max(0, raw.pitchCorrelation * 100);
-  if (pitchScore >= 70) {
-    feedback.push('Great intonation! Your pitch pattern closely matches the reference.');
-  } else if (pitchScore >= 40) {
-    feedback.push('Your intonation is somewhat similar — try to follow the rise and fall more closely.');
+  if (mfccScore >= 70) {
+    feedback.push('Excellent overall pronunciation — sounds very close to the reference!');
+  } else if (mfccScore >= 40) {
+    feedback.push('Your pronunciation is recognizable but differs from the reference — keep practicing!');
   } else {
-    feedback.push('Your intonation differs significantly — listen carefully to the reference pitch pattern.');
+    feedback.push('Your pronunciation sounds quite different — try to mimic the reference more closely.');
   }
 
-  // Duration similarity (20% weight) — MORE LENIENT formula
-  // ratio 0.7-1.3 = 100%, ratio 0.5-2.0 = 50%+, ratio <0.3 or >3.0 = 0%
+  // ── Pitch contour similarity (10% weight — reduced, AI pitch patterns are unnatural) ──
+  const pitchScore = Math.max(0, raw.pitchCorrelation * 100);
+  // Only give feedback for extreme cases since pitch matching with AI is inherently limited
+  if (pitchScore >= 80) {
+    feedback.push('Great intonation! Your pitch pattern closely matches the reference.');
+  }
+
+  // ── Duration similarity (15% weight — ASYMMETRIC: slow is OK for learners, fast is penalized) ──
   const durRatio = raw.durationRatio;
   let durScore: number;
-  if (durRatio >= 0.7 && durRatio <= 1.3) {
-    durScore = 100;  // excellent pace match
-  } else if (durRatio >= 0.5 && durRatio <= 2.0) {
-    // Gradual falloff outside the ideal range
-    const deviation = durRatio < 0.7 ? (0.7 - durRatio) / 0.2 : (durRatio - 1.3) / 0.7;
-    durScore = Math.max(50, Math.round(100 - deviation * 50));
+  if (durRatio >= 0.7 && durRatio <= 1.5) {
+    // Perfect zone (wider on the slow side — learners speaking carefully is fine)
+    durScore = 100;
+  } else if (durRatio > 1.5 && durRatio <= 3.0) {
+    // Slow but acceptable — gentle penalty (learners being careful)
+    durScore = Math.max(60, Math.round(100 - (durRatio - 1.5) * 26));
+  } else if (durRatio >= 0.4 && durRatio < 0.7) {
+    // Too fast — stronger penalty (may be slurring/skipping sounds)
+    durScore = Math.max(30, Math.round(100 - (0.7 - durRatio) * 230));
+  } else if (durRatio > 3.0) {
+    // Extremely slow
+    durScore = 50;
   } else {
-    durScore = Math.max(0, Math.round(50 - Math.abs(durRatio - 1) * 25));
+    // Extremely fast (< 0.4) — likely skipping syllables
+    durScore = Math.max(0, Math.round(30 - (0.4 - durRatio) * 100));
   }
 
-  if (durRatio > 1.5) {
-    feedback.push('You spoke slower than the reference — try to speed up slightly.');
-  } else if (durRatio < 0.5) {
-    feedback.push('You spoke faster than the reference — try to slow down.');
-  } else if (durRatio >= 0.7 && durRatio <= 1.3) {
-    feedback.push('Good speaking pace — matches the reference well!');
+  if (durRatio < 0.5) {
+    feedback.push('You spoke much faster than the reference — slow down to pronounce each syllable clearly.');
+  } else if (durRatio > 2.5) {
+    feedback.push('You spoke quite slowly — that\'s fine for practice, try to gradually speed up.');
   }
 
-  // Formant similarity (25% weight)
+  // ── Formant similarity (25% weight — vowel accuracy, crucial for intelligibility) ──
   const formantScore = (raw.f1Similarity + raw.f2Similarity) / 2;
   if (formantScore >= 70) {
     feedback.push('Excellent vowel quality — your pronunciation sounds very natural!');
   } else if (formantScore < 40) {
-    feedback.push('Your vowel sounds differ from the reference — try to listen and mimic the mouth shape.');
+    feedback.push('Your vowel sounds differ — try to adjust your mouth position.');
   }
 
-  // Intensity similarity (15% weight)
+  // ── Intensity similarity (10% weight) ──
   const intensityScore = Math.max(0, raw.intensityCorrelation * 100);
 
-  // Overall weighted similarity
+  // ── Overall weighted similarity ──
   const overallSimilarity = Math.round(
-    pitchScore * 0.40 +
-    durScore * 0.20 +
+    mfccScore * 0.40 +
+    pitchScore * 0.10 +
+    durScore * 0.15 +
     formantScore * 0.25 +
-    intensityScore * 0.15
+    intensityScore * 0.10
   );
+
+  console.log(`[PraatService] 🏆 Comparison scores → Overall: ${Math.max(0, Math.min(100, overallSimilarity))} | MFCC: ${mfccScore} | Pitch: ${Math.round(pitchScore)} | Duration: ${durScore} | Formant: ${Math.round(formantScore)} | Intensity: ${Math.round(intensityScore)}`);
 
   return {
     pitchCorrelation: raw.pitchCorrelation,
@@ -627,10 +733,16 @@ function computeComparison(raw: any): ComparisonResult {
     f2Similarity: raw.f2Similarity,
     intensityCorrelation: raw.intensityCorrelation,
     overallSimilarity: Math.max(0, Math.min(100, overallSimilarity)),
+    mfccScore: Math.round(mfccScore),
+    pitchScore: Math.round(pitchScore),
+    durationScore: Math.round(durScore),
+    formantScore: Math.round(formantScore),
+    intensityScore: Math.round(intensityScore),
     ref: raw.ref,
     user: raw.user,
     pitchContour: raw.pitchContour,
     feedback,
+    audioTimestamp: Date.now(),
   };
 }
 
@@ -642,9 +754,15 @@ function createEmptyComparison(message: string): ComparisonResult {
     f2Similarity: 0,
     intensityCorrelation: 0,
     overallSimilarity: 0,
+    mfccScore: 0,
+    pitchScore: 0,
+    durationScore: 0,
+    formantScore: 0,
+    intensityScore: 0,
     ref: { meanPitch: 0, f1: 0, f2: 0, duration: 0, meanIntensity: 0 },
     user: { meanPitch: 0, f1: 0, f2: 0, duration: 0, meanIntensity: 0 },
     pitchContour: { ref: [], user: [] },
     feedback: [message],
+    audioTimestamp: 0,
   };
 }

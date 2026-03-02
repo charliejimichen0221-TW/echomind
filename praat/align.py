@@ -55,6 +55,57 @@ def word_similarity(a: str, b: str) -> float:
     return common / longer
 
 
+def get_rms_energy(wav_path: str, start_sec: float, end_sec: float) -> float:
+    """Calculate RMS energy of a segment of a WAV file."""
+    import wave
+    import struct
+    try:
+        with wave.open(wav_path, 'rb') as w:
+            rate = w.getframerate()
+            n = w.getnframes()
+            w.readframes(0)  # reset
+            
+            start_frame = max(0, int(start_sec * rate))
+            end_frame = min(n, int(end_sec * rate))
+            if end_frame <= start_frame:
+                return 0.0
+            
+            w.setpos(start_frame)
+            frames = w.readframes(end_frame - start_frame)
+            samples = struct.unpack(f'<{len(frames)//2}h', frames)
+            
+            if not samples:
+                return 0.0
+            
+            rms = (sum(s*s for s in samples) / len(samples)) ** 0.5
+            return rms
+    except Exception:
+        return 0.0
+
+
+def get_peak_energy(wav_path: str) -> float:
+    """Get the peak RMS energy across the entire file (500ms windows)."""
+    import wave
+    import struct
+    try:
+        with wave.open(wav_path, 'rb') as w:
+            rate = w.getframerate()
+            n = w.getnframes()
+            frames = w.readframes(n)
+            samples = struct.unpack(f'<{len(frames)//2}h', frames)
+        
+        window = int(rate * 0.5)  # 500ms windows
+        max_rms = 0.0
+        for i in range(0, len(samples) - window, window // 2):
+            chunk = samples[i:i+window]
+            rms = (sum(s*s for s in chunk) / len(chunk)) ** 0.5
+            if rms > max_rms:
+                max_rms = rms
+        return max_rms
+    except Exception:
+        return 0.0
+
+
 def find_word_in_audio(wav_path: str, target_word: str, use_hint: bool = False) -> dict:
     """Find target word timestamps in audio using Whisper."""
     model = get_model()
@@ -74,9 +125,8 @@ def find_word_in_audio(wav_path: str, target_word: str, use_hint: bool = False) 
     segments, info = model.transcribe(wav_path, **transcribe_opts)
     
     target_lower = target_word.lower().strip()
-    best_match = None
-    best_score = 0
     all_words = []
+    candidates = []  # (score, word_obj, clean_word)
     
     for segment in segments:
         if segment.words:
@@ -92,18 +142,41 @@ def find_word_in_audio(wav_path: str, target_word: str, use_hint: bool = False) 
                 # Exact match (highest priority)
                 if clean_word == target_lower:
                     score = w.probability + 2.0
-                    if score > best_score:
-                        best_score = score
-                        best_match = w
+                    candidates.append((score, w, clean_word))
                     continue
                 
                 # Similar match — require at least 50% character similarity
                 sim = word_similarity(clean_word, target_lower)
                 if sim >= 0.5:
                     score = w.probability + sim
-                    if score > best_score:
-                        best_score = score
-                        best_match = w
+                    candidates.append((score, w, clean_word))
+    
+    # Sort candidates by score (highest first)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    # Energy verification: reject candidates in silent regions
+    # This prevents selecting phantom words from noise at audio boundaries
+    if candidates:
+        peak_energy = get_peak_energy(wav_path)
+        energy_threshold = peak_energy * 0.05  # 5% of peak = minimum for speech
+        
+        best_match = None
+        for score, w, cw in candidates:
+            seg_energy = get_rms_energy(wav_path, w.start, w.end)
+            if seg_energy >= energy_threshold:
+                best_match = w
+                break
+            # else: skip this candidate — it's in a silent/noise region
+        
+        if best_match is None:
+            # All candidates failed energy check — use the one with highest energy
+            # (better than returning nothing)
+            energies = [(get_rms_energy(wav_path, w.start, w.end), w) for _, w, _ in candidates]
+            energies.sort(key=lambda x: x[0], reverse=True)
+            if energies[0][0] > 0:
+                best_match = energies[0][1]
+    else:
+        best_match = None
     
     if best_match:
         # Dynamic padding based on word duration — adapts to short and long words
