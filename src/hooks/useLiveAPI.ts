@@ -121,6 +121,8 @@ export function useLiveAPI() {
   const [pronunciationScore, setPronunciationScore] = useState<PronunciationScore | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [currentTargetWord, setCurrentTargetWord] = useState<string | null>(null);
+  const [recognizedSpeech, setRecognizedSpeech] = useState<string | null>(null);
+  const [speechMismatch, setSpeechMismatch] = useState(false);
 
   // ── Refs ──
   const sessionRef = useRef<any>(null);
@@ -191,16 +193,32 @@ export function useLiveAPI() {
       userChunks = userChunks.slice(-MAX_USER_CHUNKS);
     }
 
+    // ── Check 2: Do we have a target word? ──
+    if (!target) {
+      console.log('%c[Praat] ⏭️ Skip — no target word set yet', 'color: #888');
+      setRecognizedSpeech(null);
+      return;
+    }
+
     // ── Check 3: Did user say the target word? ──
     const cleanUserText = rawUserText.replace(/[^a-zA-Z\s]/g, '').trim();
-    if (target && cleanUserText.length >= 2) {
+    if (cleanUserText.length >= 2) {
       const match = findWordInText(cleanUserText, target);
       if (!match) {
         console.log(`%c[Praat] ⏭️ Skip — "${cleanUserText}" ≠ "${target}"`, 'color: #f59e0b; font-weight: bold');
+        setRecognizedSpeech(null);
+        setSpeechMismatch(true);
+        // Auto-clear after 3 seconds
+        setTimeout(() => setSpeechMismatch(false), 3000);
         return;
       }
+      // Matched!
+      setRecognizedSpeech(cleanUserText);
+      setSpeechMismatch(false);
     } else {
-      console.log(`%c[Praat] ℹ️ No usable transcript — using full buffer`, 'color: #94a3b8');
+      console.log('%c[Praat] ⏭️ Skip — no usable speech detected', 'color: #888');
+      setRecognizedSpeech(null);
+      return;
     }
 
     // Send all user chunks to server — Whisper handles alignment there
@@ -215,7 +233,6 @@ export function useLiveAPI() {
     const t0 = performance.now();
 
     try {
-      // ── Step 1: Praat acoustic analysis ──
       const r1 = await fetch('/api/analyze-pronunciation', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -271,7 +288,13 @@ export function useLiveAPI() {
             `  Pace ratio: ${comp.durationRatio.toFixed(2)}x`,
           );
         }
-        lines.push('', 'Give data-driven pronunciation feedback (2-3 sentences). Cite specific scores.');
+        lines.push(
+          '',
+          'INSTRUCTIONS: Give brief data-driven pronunciation feedback (1-2 sentences). Cite specific scores.',
+          'IMPORTANT: Do NOT restart the pronunciation drill or ask them to repeat the word again. Continue naturally from wherever the conversation currently is.',
+          'If you already moved on (e.g., asked for a sentence), keep that flow — just briefly mention the score, then continue with what you were doing.',
+          'Example: "By the way, your pronunciation scored 65% — your vowels were good but the pace was a bit slow. Now, back to your sentence..."',
+        );
 
         if (sessionRef.current) {
           console.log('%c[Praat] 📤 Sending to AI...', 'color: #f472b6; font-weight: bold; font-size: 13px');
@@ -379,27 +402,55 @@ export function useLiveAPI() {
             if (outText) {
               aiTranscriptRef.current += ' ' + outText;
 
-              // Debounced target word extraction (skip during Praat feedback turns)
+              // Skip target word extraction during Praat feedback turns
               if (!isPraatResponseRef.current) {
-                if (extractTimerRef.current) clearTimeout(extractTimerRef.current);
-                extractTimerRef.current = setTimeout(() => {
-                  // Double-check: don't extract if we entered a Praat response during the delay
-                  if (isPraatResponseRef.current) return;
-                  const full = aiTranscriptRef.current.replace(/\s+/g, ' ').trim();
-                  if (full.length > 80) {
-                    extractTargetWord(full).then(w => {
-                      if (w && w !== targetWordRef.current) {
-                        console.log(`%c[DeepSeek] 🎯 Target word CHANGED: "${targetWordRef.current}" → "${w}" — clearing ref`, 'color: #38bdf8; font-weight: bold');
+                const full = aiTranscriptRef.current.replace(/\s+/g, ' ').trim();
+
+                // ── Primary: parse "repeat after me... [word]" pattern (instant, free, 100% reliable) ──
+                const echoMatch = full.match(/repeat\s+after\s+me[,.\s…—:;-]*(\w{3,})/i);
+                if (echoMatch) {
+                  const detected = echoMatch[1].toLowerCase();
+                  if (detected !== targetWordRef.current) {
+                    console.log(`%c[Echo] 🎯 Target word DETECTED: "${targetWordRef.current}" → "${detected}" — clearing ref`, 'color: #34d399; font-weight: bold');
+                    targetWordRef.current = detected;
+                    setCurrentTargetWord(detected);
+                    lastAiChunksRef.current = [];
+                  }
+                  // Cancel any pending DeepSeek call — we already have the word
+                  if (extractTimerRef.current) { clearTimeout(extractTimerRef.current); extractTimerRef.current = null; }
+                } else {
+                  // ── Fallback: DeepSeek extraction (only if "repeat after me" not found) ──
+                  if (extractTimerRef.current) clearTimeout(extractTimerRef.current);
+                  extractTimerRef.current = setTimeout(() => {
+                    if (isPraatResponseRef.current) return;
+                    // Re-check for echo pattern one more time with full accumulated text
+                    const fullText = aiTranscriptRef.current.replace(/\s+/g, ' ').trim();
+                    const recheck = fullText.match(/repeat\s+after\s+me[,.\s…—:;-]*(\w{3,})/i);
+                    if (recheck) {
+                      const w = recheck[1].toLowerCase();
+                      if (w !== targetWordRef.current) {
+                        console.log(`%c[Echo] 🎯 Target word (delayed): "${w}"`, 'color: #34d399; font-weight: bold');
                         targetWordRef.current = w;
                         setCurrentTargetWord(w);
-                        // Clear ref so next AI turn saves fresh ref for new word
                         lastAiChunksRef.current = [];
-                      } else if (w) {
-                        console.log(`%c[DeepSeek] ✅ Target word confirmed: "${w}"`, 'color: #38bdf8');
                       }
-                    });
-                  }
-                }, 2500);  // wait 2.5s for AI to say enough context
+                      return;
+                    }
+                    // Still not found — use DeepSeek as last resort
+                    if (fullText.length > 80) {
+                      extractTargetWord(fullText).then(w => {
+                        if (w && w !== targetWordRef.current) {
+                          console.log(`%c[DeepSeek] 🎯 Target word CHANGED: "${targetWordRef.current}" → "${w}" — clearing ref`, 'color: #38bdf8; font-weight: bold');
+                          targetWordRef.current = w;
+                          setCurrentTargetWord(w);
+                          lastAiChunksRef.current = [];
+                        } else if (w) {
+                          console.log(`%c[DeepSeek] ✅ Target word confirmed: "${w}"`, 'color: #38bdf8');
+                        }
+                      });
+                    }
+                  }, 3000);
+                }
               }
             }
 
@@ -523,7 +574,7 @@ export function useLiveAPI() {
 
   return {
     isConnected, isListening, isSpeaking, volume, transcript, error,
-    pronunciationScore, isAnalyzing, currentTargetWord,
+    pronunciationScore, isAnalyzing, currentTargetWord, recognizedSpeech, speechMismatch,
     connect, disconnect, setBuffering, pauseAI, resumeAI,
   };
 }

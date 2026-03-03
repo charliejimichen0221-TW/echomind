@@ -15,7 +15,7 @@ const TRAINING_LEVELS = [
 ];
 
 export default function App() {
-  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord, pauseAI, resumeAI } = useLiveAPI();
+  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord, recognizedSpeech, speechMismatch, pauseAI, resumeAI } = useLiveAPI();
   const [selectedLevel, setSelectedLevel] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [debaterImage, setDebaterImage] = useState<string | null>(null);
@@ -193,6 +193,13 @@ export default function App() {
     - ❌ ABSOLUTELY FORBIDDEN: "Great pronunciation!", "That sounded good!", "Nice try!", "Your pitch was...", "Your vowels..." 
     - ❌ NEVER say anything about pitch, vowels, clarity, intonation, or pronunciation quality on your own.
     - ❌ NEVER make up scores, percentages, or analysis data.
+    
+    WHEN YOU SEE "[SYSTEM_NOTIFICATION: ANALYZING_AUDIO_PLEASE_WAIT]":
+    - This means the system is currently running Praat acoustic analysis on the user's speech.
+    - You MUST respond with ONLY a brief, neutral acknowledgment (e.g., "Let me check that for you!" or "One moment while I analyze...")
+    - ❌ Do NOT evaluate, judge, or comment on the pronunciation in ANY way.
+    - ❌ Do NOT say "good", "nice", "great", "not bad", or any quality judgment.
+    - The objective analysis data will arrive shortly as [PRONUNCIATION_ANALYSIS_RESULT]. Wait for it.
     
     WHEN YOU RECEIVE "[PRONUNCIATION_ANALYSIS_RESULT]":
     - This is REAL data from Praat acoustic analysis software. ONLY THEN may you discuss pronunciation.
@@ -499,6 +506,45 @@ export default function App() {
                           </div>
                         )}
                       </div>
+
+                      {/* Speech Recognition Feedback */}
+                      <AnimatePresence>
+                        {/* ✅ Matched */}
+                        {recognizedSpeech && currentTargetWord &&
+                          recognizedSpeech.toLowerCase().includes(currentTargetWord.toLowerCase()) && (
+                            <motion.div
+                              initial={{ opacity: 0, y: -8 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              exit={{ opacity: 0, y: -8 }}
+                              className="mb-4 px-4 py-3 rounded-2xl bg-emerald-500/5 border border-emerald-500/20"
+                            >
+                              <div className="flex items-center gap-2.5">
+                                <div className="w-6 h-6 rounded-full bg-emerald-500/20 flex items-center justify-center">
+                                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                                </div>
+                                <span className="text-sm font-semibold text-emerald-400">Matched!</span>
+                                <span className="text-[10px] text-zinc-500 ml-auto">Analyzing pronunciation...</span>
+                              </div>
+                            </motion.div>
+                          )}
+
+                        {/* ❌ Mismatch — subtle try again prompt */}
+                        {speechMismatch && (
+                          <motion.div
+                            initial={{ opacity: 0, y: -8 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -8 }}
+                            className="mb-4 px-4 py-2.5 rounded-2xl bg-amber-500/5 border border-amber-500/15"
+                          >
+                            <div className="flex items-center gap-2.5">
+                              <div className="w-5 h-5 rounded-full bg-amber-500/15 flex items-center justify-center">
+                                <AudioLines className="w-3 h-3 text-amber-400" />
+                              </div>
+                              <span className="text-xs font-medium text-amber-400/90">Not the target word !!!</span>
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
 
                       {pronunciationScore && !isAnalyzing && (
                         <>

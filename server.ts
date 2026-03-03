@@ -181,19 +181,23 @@ app.post('/api/extract-target-word', async (req, res) => {
       return res.json({ status: 'success', word: null });
     }
 
+    // Strip MASTERED: tags from transcript — these are hidden system tags, not target words
+    const cleanTranscript = transcript.replace(/MASTERED:\s*\[?\w+\]?/gi, '').trim();
+
     const prompt = `You are analyzing an English vocabulary teaching session transcript.
 Extract the SINGLE vocabulary word that the teacher is CURRENTLY asking the student to practice or repeat.
 
 Rules:
 - Return ONLY the target vocabulary word, nothing else.
-- Do NOT return common teaching words like "vocabulary", "training", "repeat", "practice", "echo", "listen".
+- Do NOT return common teaching words like "vocabulary", "training", "repeat", "practice", "echo", "listen", "mastered", "master", "session", "analysis", "pronunciation".
 - The target word is typically the new/difficult word being taught.
 - If the teacher is just introducing themselves or chatting (not teaching a specific word yet), return "NONE".
 - IMPORTANT: If multiple words appear in the transcript, return ONLY the LAST/MOST RECENT one. The teacher moves from word to word — always return the newest word being practiced, NOT earlier ones.
 - If the teacher is giving feedback about pronunciation (e.g. "great job", "try again"), the target word is the one they are giving feedback about.
+- NEVER return "mastered" — this is a system keyword, not a vocabulary word.
 
 Transcript:
-"${transcript.substring(0, 500)}"
+"${cleanTranscript.substring(0, 500)}"
 
 Target word:`;
 
@@ -220,7 +224,9 @@ Target word:`;
 
     console.log(`[DeepSeek] 📥 Raw: "${rawWord}" → Parsed: "${word}"`);
 
-    if (word && word !== 'none' && word.length >= 3) {
+    // Filter out known non-target words
+    const blacklist = ['none', 'mastered', 'master', 'repeat', 'practice', 'echo', 'listen', 'vocabulary', 'training', 'session', 'analysis', 'pronunciation'];
+    if (word && !blacklist.includes(word) && word.length >= 3) {
       console.log(`[DeepSeek] ✅ Target word: "${word}"`);
       res.json({ status: 'success', word });
     } else {
