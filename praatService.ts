@@ -16,11 +16,23 @@ const PRAAT_COMPARE_SCRIPT = path.join(process.cwd(), 'praat', 'compare.praat');
 const ALIGN_SCRIPT = path.join(process.cwd(), 'praat', 'align.py');
 const MFCC_DTW_SCRIPT = path.join(process.cwd(), 'praat', 'mfcc_dtw.py');
 
+// Toggle server-side debug logging: set ECHOMIND_DEBUG=1 in environment
+const DEBUG = !!process.env.ECHOMIND_DEBUG;
+function sdbg(tag: string, msg: string, ...args: any[]) {
+  if (!DEBUG) return;
+  const ts = new Date().toISOString().slice(11, 23);
+  if (args.length > 0) {
+    console.log(`[${ts}] [DBG:${tag}] ${msg}`, ...args);
+  } else {
+    console.log(`[${ts}] [DBG:${tag}] ${msg}`);
+  }
+}
+
 /**
  * Use Whisper to find the target word's start/end timestamps in a WAV file.
  * Returns {found, start, end} or {found: false} if word not detected.
  */
-async function whisperAlign(wavPath: string, targetWord: string, useHint: boolean = false): Promise<{ found: boolean; start?: number; end?: number; word?: string }> {
+async function whisperAlign(wavPath: string, targetWord: string, useHint: boolean = false): Promise<{ found: boolean; start?: number; end?: number; word?: string; all_words?: { word: string; start: number; end: number; probability: number }[] }> {
   return new Promise((resolve) => {
     const args = [ALIGN_SCRIPT, wavPath, targetWord];
     if (useHint) args.push('--hint');
@@ -45,13 +57,39 @@ async function whisperAlign(wavPath: string, targetWord: string, useHint: boolea
  * Extract a segment from a WAV file (with header) by time range.
  * Returns a new WAV buffer containing only the specified segment.
  */
-function extractWavSegment(wavBuffer: Buffer, sampleRate: number, startSec: number, endSec: number): Buffer {
+function extractWavSegment(wavBuffer: Buffer, sampleRate: number, startSec: number, endSec: number, label: string = 'unknown'): Buffer {
   const headerSize = 44;
   const bytesPerSample = 2; // 16-bit
   const startByte = headerSize + Math.floor(startSec * sampleRate * bytesPerSample);
   const endByte = Math.min(wavBuffer.length, headerSize + Math.ceil(endSec * sampleRate * bytesPerSample));
+  const segmentBytes = endByte - startByte;
+  const segmentSamples = segmentBytes / bytesPerSample;
+  const segmentDuration = segmentSamples / sampleRate;
+
+  sdbg('audio', `[extractWavSegment:${label}] startSec=${startSec.toFixed(3)}s endSec=${endSec.toFixed(3)}s → startByte=${startByte} endByte=${endByte} segBytes=${segmentBytes} samples=${segmentSamples} dur=${segmentDuration.toFixed(3)}s @${sampleRate}Hz`);
+  sdbg('audio', `[extractWavSegment:${label}] totalWavSize=${wavBuffer.length} headerSize=${headerSize} totalPcmBytes=${wavBuffer.length - headerSize}`);
+
+  if (segmentBytes <= 0) {
+    sdbg('audio', `[extractWavSegment:${label}] ⚠️ EMPTY SEGMENT! startByte(${startByte}) >= endByte(${endByte})`);
+  }
 
   const pcmSegment = wavBuffer.slice(startByte, endByte);
+
+  // Analyze the extracted PCM quality
+  if (pcmSegment.length >= 2) {
+    const samples = new Int16Array(pcmSegment.buffer, pcmSegment.byteOffset, pcmSegment.length / 2);
+    let maxAmp = 0, zeroCount = 0, sumSq = 0, jumps = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const a = Math.abs(samples[i]);
+      if (a > maxAmp) maxAmp = a;
+      if (a === 0) zeroCount++;
+      sumSq += samples[i] * samples[i];
+      if (i > 0 && Math.abs(samples[i] - samples[i - 1]) > 15000) jumps++;
+    }
+    const rms = Math.sqrt(sumSq / samples.length);
+    sdbg('audio', `[extractWavSegment:${label}] PCM stats: maxAmp=${maxAmp}/32768 zeroPct=${((zeroCount / samples.length) * 100).toFixed(1)}% RMS=${rms.toFixed(1)} largeJumps=${jumps}`);
+  }
+
   return pcmToWav(pcmSegment, sampleRate);
 }
 
@@ -434,8 +472,9 @@ function createEmptyScore(message: string): PronunciationScore {
 
 /**
  * Normalize a WAV buffer for playback:
- * 1. Resample to 16kHz (consistent rate for both ref & user)
- * 2. Peak-normalize loudness (both clips reach same max volume)
+ * 1. Low-pass filter (anti-aliasing before downsampling)
+ * 2. Resample to 16kHz (consistent rate for both ref & user)
+ * 3. Gentle peak-normalize loudness (capped gain to avoid amplifying noise)
  */
 function normalizeWavForPlayback(wavBuffer: Buffer, originalRate: number): Buffer {
   const headerSize = 44;
@@ -452,8 +491,35 @@ function normalizeWavForPlayback(wavBuffer: Buffer, originalRate: number): Buffe
   let resampled: Int16Array;
 
   if (originalRate !== targetRate) {
-    // Simple linear interpolation resampling
+    // ── Step 1: Multi-pass low-pass filter to prevent aliasing ──
+    // 2-pass with width=3 balances: static removal vs. speech clarity
+    // (3-pass/width=5 was too aggressive — sounded muffled)
     const ratio = originalRate / targetRate;
+    const filterWidth = 2;   // gentle window
+    const PASSES = 2;        // 2 passes ≈ triangular rolloff
+
+    let current = new Float64Array(samples.length);
+    for (let i = 0; i < samples.length; i++) current[i] = samples[i];
+
+    for (let pass = 0; pass < PASSES; pass++) {
+      const next = new Float64Array(current.length);
+      const half = Math.floor(filterWidth / 2);
+      for (let i = 0; i < current.length; i++) {
+        let sum = 0;
+        let count = 0;
+        const lo = Math.max(0, i - half);
+        const hi = Math.min(current.length, i + half + 1);
+        for (let j = lo; j < hi; j++) {
+          sum += current[j];
+          count++;
+        }
+        next[i] = sum / count;
+      }
+      current = next;
+    }
+    sdbg('audio', `[LPF] ${PASSES}-pass moving avg, width=${filterWidth}, ratio=${ratio.toFixed(2)}, inputSamples=${samples.length}`);
+
+    // ── Step 2: Downsample with linear interpolation ──
     const newLen = Math.floor(samples.length / ratio);
     resampled = new Int16Array(newLen);
     for (let i = 0; i < newLen; i++) {
@@ -461,21 +527,26 @@ function normalizeWavForPlayback(wavBuffer: Buffer, originalRate: number): Buffe
       const lo = Math.floor(srcIdx);
       const hi = Math.min(lo + 1, samples.length - 1);
       const frac = srcIdx - lo;
-      resampled[i] = Math.round(samples[lo] * (1 - frac) + samples[hi] * frac);
+      resampled[i] = Math.round(current[lo] * (1 - frac) + current[hi] * frac);
     }
   } else {
     resampled = new Int16Array(samples);
   }
 
-  // Peak normalization — scale so the loudest sample reaches 90% of max (avoid clipping)
+  // ── Step 3: Gentle peak normalization ──
+  // Cap gain at 3x to prevent amplifying noise/artifacts in quiet segments
   let maxAmp = 0;
   for (let i = 0; i < resampled.length; i++) {
     const a = Math.abs(resampled[i]);
     if (a > maxAmp) maxAmp = a;
   }
 
-  if (maxAmp > 0 && maxAmp < 29000) {
-    const scale = 29000 / maxAmp; // ~88% of 32768
+  const targetAmp = 25000; // ~76% of 32768 (conservative to avoid clipping)
+  const MAX_GAIN = 3.0;    // never amplify more than 3x
+  if (maxAmp > 0 && maxAmp < targetAmp) {
+    const rawScale = targetAmp / maxAmp;
+    const scale = Math.min(rawScale, MAX_GAIN);
+    sdbg('audio', `Peak normalize: maxAmp=${maxAmp}, rawScale=${rawScale.toFixed(2)}, cappedScale=${scale.toFixed(2)}`);
     for (let i = 0; i < resampled.length; i++) {
       resampled[i] = Math.round(Math.max(-32768, Math.min(32767, resampled[i] * scale)));
     }
@@ -532,39 +603,84 @@ export async function comparePronunciation(
   if (targetWord) {
     console.log(`[Whisper] 🎯 Aligning "${targetWord}" in both audio files...`);
 
+    // ── Pre-trim ref audio for Whisper ──
+    // The ref chunks from frontend may still contain other words around the target.
+    // Trimming silence helps Whisper focus on the speech portion.
+    const trimmedRefPCM = trimSilence(rawRefPCM, AI_OUTPUT_RATE, 'ref-pre-whisper');
+    const trimmedRefWav = pcmToWav(trimmedRefPCM, AI_OUTPUT_RATE);
+    const trimmedRefWavPath = path.join(tmpDir, `echomind_ref_pretrimmed_${ts}.wav`);
+    fs.writeFileSync(trimmedRefWavPath, trimmedRefWav);
+    const refTrimmedDuration = (trimmedRefPCM.length / 2 / AI_OUTPUT_RATE).toFixed(2);
+    const refFullDuration = (rawRefPCM.length / 2 / AI_OUTPUT_RATE).toFixed(2);
+    console.log(`[Whisper] ✂️ Pre-trim ref: ${refFullDuration}s → ${refTrimmedDuration}s (removed ${(parseFloat(refFullDuration) - parseFloat(refTrimmedDuration)).toFixed(2)}s silence)`);
+
+    // ── Pre-trim user audio for Whisper (Issue #010) ──
+    // User buffer often has long leading silence (user thinking before speaking).
+    // Whisper tiny struggles to find the target word in 25s audio that's mostly silence.
+    // Solution: trim silence BEFORE sending to Whisper, so it only sees active speech (~5-6s).
+    // The original fullUserWav is preserved for debug files.
+    const trimmedUserPCM = trimSilence(rawUserPCM, sampleRate, 'user-pre-whisper');
+    const trimmedUserWav = pcmToWav(trimmedUserPCM, sampleRate);
+    const trimmedUserWavPath = path.join(tmpDir, `echomind_user_pretrimmed_${ts}.wav`);
+    fs.writeFileSync(trimmedUserWavPath, trimmedUserWav);
+    const trimmedDuration = (trimmedUserPCM.length / 2 / sampleRate).toFixed(2);
+    const fullDuration = (rawUserPCM.length / 2 / sampleRate).toFixed(2);
+    console.log(`[Whisper] ✂️ Pre-trim user: ${fullDuration}s → ${trimmedDuration}s (removed ${(parseFloat(fullDuration) - parseFloat(trimmedDuration)).toFixed(2)}s silence)`);
+
     // Run alignment on BOTH files in parallel
-    // Ref: no hint needed (AI speech is clear)
-    // User: use hint (tells Whisper what word to expect for accented speech)
+    // Both use hint to tell Whisper what word to expect
+    // (AI synthetic speech is also hard for Whisper tiny to parse without a hint)
     const [refAlign, userAlign] = await Promise.all([
-      whisperAlign(fullRefWavPath, targetWord, false),
-      whisperAlign(fullUserWavPath, targetWord, true),
+      whisperAlign(trimmedRefWavPath, targetWord, true),
+      whisperAlign(trimmedUserWavPath, targetWord, true),
     ]);
 
-    // ALWAYS align ref — AI speech is clear, Whisper is reliable
+    // Log what Whisper actually heard (helps debug failed alignments)
+    if (refAlign.all_words) {
+      const heard = refAlign.all_words.map((w) => w.word).join(' ');
+      sdbg('audio', `[REF alignment] Whisper heard: "${heard}"`);
+    }
+
+    // Align ref — extract target word segment
     // Note: align.py already adds dynamic padding (150-600ms), no extra padding needed here
+    // Timestamps are relative to the pre-trimmed WAV, so extract from trimmedRefWav
     if (refAlign.found && refAlign.start !== undefined && refAlign.end !== undefined) {
-      const refSeg = extractWavSegment(fullRefWav, AI_OUTPUT_RATE, refAlign.start, refAlign.end);
+      sdbg('audio', `[REF alignment] Whisper found "${refAlign.word}" at ${refAlign.start}s-${refAlign.end}s (${(refAlign.end - refAlign.start).toFixed(3)}s) — extracting from trimmedRefWav (${trimmedRefWav.length} bytes, @${AI_OUTPUT_RATE}Hz)`);
+      const refSeg = extractWavSegment(trimmedRefWav, AI_OUTPUT_RATE, refAlign.start, refAlign.end, 'REF');
       refWavPath = path.join(tmpDir, `echomind_ref_aligned_${ts}.wav`);
       fs.writeFileSync(refWavPath, refSeg);
+      sdbg('audio', `[REF alignment] ✅ Aligned ref saved: ${refSeg.length} bytes → ${refWavPath}`);
       console.log(`[Whisper] ✅ Ref "${refAlign.word}" aligned: ${refAlign.start}s-${refAlign.end}s (${(refAlign.end - refAlign.start).toFixed(2)}s)`);
     } else {
-      console.log(`[Whisper] ⚠️ Ref: word not found — using full ref audio`);
+      // Whisper still couldn't find the word — use trimmed ref instead of full ref
+      sdbg('audio', `[REF alignment] ⚠️ Whisper did NOT find "${targetWord}" in ref — using trimmed ref audio (${trimmedRefWav.length} bytes)`);
+      console.log(`[Whisper] ⚠️ Ref: word not found — using trimmed ref audio`);
+      refWavPath = trimmedRefWavPath;
     }
 
     // Align user if possible — user speech may be unclear
-    // Note: align.py already adds dynamic padding (150-600ms), no extra padding needed here
+    // Note: Whisper timestamps are relative to the pre-trimmed WAV,
+    //        so we extract from trimmedUserWav (not fullUserWav)
     if (userAlign.found && userAlign.start !== undefined && userAlign.end !== undefined) {
-      const userSeg = extractWavSegment(fullUserWav, sampleRate, userAlign.start, userAlign.end);
+      sdbg('audio', `[USER alignment] Whisper found "${userAlign.word}" at ${userAlign.start}s-${userAlign.end}s (${(userAlign.end - userAlign.start).toFixed(3)}s) — extracting from trimmedUserWav (${trimmedUserWav.length} bytes, @${sampleRate}Hz)`);
+      const userSeg = extractWavSegment(trimmedUserWav, sampleRate, userAlign.start, userAlign.end, 'USER');
       userWavPath = path.join(tmpDir, `echomind_user_aligned_${ts}.wav`);
       fs.writeFileSync(userWavPath, userSeg);
+      sdbg('audio', `[USER alignment] ✅ Aligned user saved: ${userSeg.length} bytes → ${userWavPath}`);
       console.log(`[Whisper] ✅ User "${userAlign.word}" aligned: ${userAlign.start}s-${userAlign.end}s (${(userAlign.end - userAlign.start).toFixed(2)}s)`);
     } else {
-      // Whisper couldn't find the word — fallback to trimSilence to remove silence padding
-      console.log(`[Whisper] ⚠️ User: word not recognized — falling back to trimSilence`);
-      const trimmedUserPCM = trimSilence(rawUserPCM, sampleRate, 'user');
-      const trimmedUserWav = pcmToWav(trimmedUserPCM, sampleRate);
-      userWavPath = path.join(tmpDir, `echomind_user_trimmed_${ts}.wav`);
-      fs.writeFileSync(userWavPath, trimmedUserWav);
+      // Whisper couldn't find even in trimmed audio — use the trimmed version as-is
+      sdbg('audio', `[USER alignment] ⚠️ Whisper did NOT find "${targetWord}" — using pre-trimmed audio as fallback`);
+      console.log(`[Whisper] ⚠️ User: word not recognized — using pre-trimmed audio (${trimmedDuration}s)`);
+      userWavPath = trimmedUserWavPath;
+    }
+
+    // Clean up pre-trimmed temp files if they weren't used as the final paths
+    if (userWavPath !== trimmedUserWavPath) {
+      try { fs.unlinkSync(trimmedUserWavPath); } catch { }
+    }
+    if (refWavPath !== trimmedRefWavPath) {
+      try { fs.unlinkSync(trimmedRefWavPath); } catch { }
     }
   }
 
@@ -572,16 +688,68 @@ export async function comparePronunciation(
   const debugDir = path.join(process.cwd(), 'debug');
   if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
 
+  // Log WAV sizes before normalization (helps debug static audio issue)
+  const refWavBuf = fs.readFileSync(refWavPath);
+  const userWavBuf = fs.readFileSync(userWavPath);
+  sdbg('audio', `Before normalize — ref: ${refWavBuf.length} bytes (${((refWavBuf.length - 44) / 2 / AI_OUTPUT_RATE).toFixed(3)}s @${AI_OUTPUT_RATE}Hz), user: ${userWavBuf.length} bytes (${((userWavBuf.length - 44) / 2 / sampleRate).toFixed(3)}s @${sampleRate}Hz)`);
+
+  // Check if ref WAV has valid content (not mostly zeros)
+  const refPcm = new Int16Array(refWavBuf.buffer, refWavBuf.byteOffset + 44, (refWavBuf.length - 44) / 2);
+  let refMaxAmp = 0, refZeroCount = 0;
+  for (let i = 0; i < refPcm.length; i++) {
+    const a = Math.abs(refPcm[i]);
+    if (a > refMaxAmp) refMaxAmp = a;
+    if (a === 0) refZeroCount++;
+  }
+  const refZeroPct = ((refZeroCount / refPcm.length) * 100).toFixed(1);
+  sdbg('audio', `Ref audio quality: maxAmp=${refMaxAmp}/32768, zeroPct=${refZeroPct}%, samples=${refPcm.length}`);
+  if (refMaxAmp < 500) {
+    console.warn(`[PraatService] ⚠️ REF AUDIO VERY QUIET: maxAmp=${refMaxAmp} — may sound like static!`);
+  }
+  if (parseFloat(refZeroPct) > 80) {
+    console.warn(`[PraatService] ⚠️ REF AUDIO MOSTLY ZEROS: ${refZeroPct}% — extraction may have failed!`);
+  }
+
   // Normalize both to 16kHz and peak-normalize loudness for fair playback comparison
-  const refNorm = normalizeWavForPlayback(fs.readFileSync(refWavPath), AI_OUTPUT_RATE);
-  const userNorm = normalizeWavForPlayback(fs.readFileSync(userWavPath), sampleRate);
+  sdbg('audio', `[NORMALIZE] Starting ref normalization: ${refWavBuf.length} bytes @${AI_OUTPUT_RATE}Hz → 16kHz`);
+  const refNorm = normalizeWavForPlayback(refWavBuf, AI_OUTPUT_RATE);
+  sdbg('audio', `[NORMALIZE] Starting user normalization: ${userWavBuf.length} bytes @${sampleRate}Hz → 16kHz`);
+  const userNorm = normalizeWavForPlayback(userWavBuf, sampleRate);
+
+  // Analyze normalized output quality (detect static/clipping)
+  const analyzeNormalized = (buf: Buffer, label: string) => {
+    if (buf.length < 46) return;
+    const pcm = new Int16Array(buf.buffer, buf.byteOffset + 44, (buf.length - 44) / 2);
+    let maxA = 0, zeros = 0, sumSq = 0, jumps = 0;
+    for (let i = 0; i < pcm.length; i++) {
+      const a = Math.abs(pcm[i]);
+      if (a > maxA) maxA = a;
+      if (a === 0) zeros++;
+      sumSq += pcm[i] * pcm[i];
+      if (i > 0 && Math.abs(pcm[i] - pcm[i - 1]) > 15000) jumps++;
+    }
+    const rms = Math.sqrt(sumSq / pcm.length);
+    const dur = (pcm.length / 16000).toFixed(3);
+    sdbg('audio', `[NORMALIZE:${label}] Output: ${buf.length} bytes, ${pcm.length} samples, ${dur}s @16kHz`);
+    sdbg('audio', `[NORMALIZE:${label}] Quality: maxAmp=${maxA}/32768 zeroPct=${((zeros / pcm.length) * 100).toFixed(1)}% RMS=${rms.toFixed(1)} largeJumps=${jumps}`);
+    if (jumps > 100) {
+      console.warn(`[PraatService] ⚠️ ${label}_recording.wav has ${jumps} large jumps — likely STATIC/NOISE!`);
+    }
+    if (maxA >= 32768) {
+      console.warn(`[PraatService] ⚠️ ${label}_recording.wav CLIPPING detected (maxAmp=${maxA})!`);
+    }
+  };
+  analyzeNormalized(refNorm, 'REF');
+  analyzeNormalized(userNorm, 'USER');
+
   fs.writeFileSync(path.join(debugDir, 'ref_recording.wav'), refNorm);
   fs.writeFileSync(path.join(debugDir, 'user_recording.wav'), userNorm);
 
   // Also save full (pre-alignment) copies for inspection
   fs.copyFileSync(fullRefWavPath, path.join(debugDir, 'ref_full.wav'));
   fs.copyFileSync(fullUserWavPath, path.join(debugDir, 'user_full.wav'));
-  console.log(`[PraatService] 🐛 Debug files saved (aligned + normalized to 16kHz)`);
+  console.log(`[PraatService] 🐛 Debug files saved to ${debugDir}`);
+  sdbg('audio', `[DEBUG FILES] ref_full.wav=${fullRefWav.length}B, ref_recording.wav=${refNorm.length}B, user_full.wav=${fullUserWav.length}B, user_recording.wav=${userNorm.length}B`);
 
   try {
     console.log('[PraatService] 🔬 Running Praat + MFCC-DTW comparison...');
@@ -657,7 +825,7 @@ export async function comparePronunciation(
 function computeComparison(raw: any): ComparisonResult {
   const feedback: string[] = [];
 
-  // ── MFCC-DTW distance → score (40% weight — core "does it sound like the same word?") ──
+  // ── MFCC-DTW distance → score (45% weight — core "does it sound like the same word?") ──
   // DTW distance: 0 = identical, ~15 = similar, ~40+ = very different
   const dtwDist = raw.dtwDistance ?? 999;
   const mfccScore = dtwDist < 900 ? Math.max(0, Math.round(100 * Math.exp(-dtwDist / 25))) : 0;
@@ -671,7 +839,7 @@ function computeComparison(raw: any): ComparisonResult {
     feedback.push('Your pronunciation sounds quite different — try to mimic the reference more closely.');
   }
 
-  // ── Pitch contour similarity (10% weight — reduced, AI pitch patterns are unnatural) ──
+  // ── Pitch contour similarity (5% weight — low, AI pitch patterns are unnatural) ──
   const pitchScore = Math.max(0, raw.pitchCorrelation * 100);
   // Only give feedback for extreme cases since pitch matching with AI is inherently limited
   if (pitchScore >= 80) {
@@ -704,7 +872,7 @@ function computeComparison(raw: any): ComparisonResult {
     feedback.push('You spoke quite slowly — that\'s fine for practice, try to gradually speed up.');
   }
 
-  // ── Formant similarity (25% weight — vowel accuracy, crucial for intelligibility) ──
+  // ── Formant similarity (30% weight — vowel accuracy, crucial for intelligibility) ──
   const formantScore = (raw.f1Similarity + raw.f2Similarity) / 2;
   if (formantScore >= 70) {
     feedback.push('Excellent vowel quality — your pronunciation sounds very natural!');
@@ -712,16 +880,18 @@ function computeComparison(raw: any): ComparisonResult {
     feedback.push('Your vowel sounds differ — try to adjust your mouth position.');
   }
 
-  // ── Intensity similarity (10% weight) ──
+  // ── Intensity similarity (5% weight — low, mic volume varies too much) ──
   const intensityScore = Math.max(0, raw.intensityCorrelation * 100);
 
   // ── Overall weighted similarity ──
+  // Weights: MFCC 45% | Formant 30% | Duration 15% | Pitch 5% | Intensity 5%
+  // Pitch & Intensity are low because AI synthesis vs human voice makes them unreliable
   const overallSimilarity = Math.round(
-    mfccScore * 0.40 +
-    pitchScore * 0.10 +
+    mfccScore * 0.45 +
+    pitchScore * 0.05 +
     durScore * 0.15 +
-    formantScore * 0.25 +
-    intensityScore * 0.10
+    formantScore * 0.30 +
+    intensityScore * 0.05
   );
 
   console.log(`[PraatService] 🏆 Comparison scores → Overall: ${Math.max(0, Math.min(100, overallSimilarity))} | MFCC: ${mfccScore} | Pitch: ${Math.round(pitchScore)} | Duration: ${durScore} | Formant: ${Math.round(formantScore)} | Intensity: ${Math.round(intensityScore)}`);

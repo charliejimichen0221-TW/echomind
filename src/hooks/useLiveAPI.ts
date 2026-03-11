@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef } from 'react';
 import { GoogleGenAI, Modality, LiveServerMessage } from "@google/genai";
 import { AudioProcessor, AudioPlayer } from '../utils/audioUtils';
+import { dbg, dbgUpdateState, dbgGetState, dbgStateTransition, dbgTimed } from '../utils/debugLogger';
 
 // ═══════════════════════════════════════════════
 // Types
@@ -74,19 +75,57 @@ function findWordInText(text: string, target: string): { idx: number; total: num
   const t = target.toLowerCase().replace(/[^a-z]/g, '');
   if (!t) return null;
 
-  // Exact
+  console.log(`%c[Match] 🔎 findWordInText: words=[${words.map(w => `"${w}"`).join(', ')}] target="${t}"`, 'color: #94a3b8; font-size: 10px');
+
+  // 1. Exact single-word match
   for (let i = 0; i < words.length; i++) {
-    if (words[i].toLowerCase().replace(/[^a-z]/g, '') === t) return { idx: i, total: words.length };
+    const w = words[i].toLowerCase().replace(/[^a-z]/g, '');
+    if (w === t) {
+      console.log(`%c[Match] ✅ Strategy 1 (EXACT): word[${i}]="${w}" === "${t}"`, 'color: #34d399');
+      return { idx: i, total: words.length };
+    }
   }
-  // Fuzzy
-  let best = -1, bestScore = 0;
+
+  // 2. Sliding window: join consecutive words and check if they form the target
+  //    This handles Gemini splitting "hypothesis" → "hy po the sis"
+  for (let winSize = 2; winSize <= Math.min(words.length, 8); winSize++) {
+    for (let i = 0; i <= words.length - winSize; i++) {
+      const joined = words.slice(i, i + winSize).join('').toLowerCase().replace(/[^a-z]/g, '');
+      if (joined === t) {
+        console.log(`%c[Match] ✅ Strategy 2 (SLIDING EXACT): joined "${joined}" === "${t}" (win=${winSize}, pos=${i})`, 'color: #34d399');
+        return { idx: i, total: words.length };
+      }
+      const sim = levenshteinSimilarity(joined, t);
+      if (sim > 0.75) {
+        console.log(`%c[Match] ✅ Strategy 2 (SLIDING FUZZY): joined "${joined}" ~ "${t}" sim=${sim.toFixed(3)} > 0.75 (win=${winSize}, pos=${i})`, 'color: #34d399');
+        return { idx: i, total: words.length };
+      }
+    }
+  }
+
+  // 3. Full text contains target (fallback: user said it in a sentence)
+  const fullClean = text.toLowerCase().replace(/\s+/g, '').replace(/[^a-z]/g, '');
+  if (fullClean.includes(t)) {
+    console.log(`%c[Match] ✅ Strategy 3 (CONTAINS): "${fullClean}" includes "${t}"`, 'color: #34d399');
+    return { idx: 0, total: words.length };
+  }
+
+  // 4. Fuzzy single-word match (strict threshold: 0.75)
+  let best = -1, bestScore = 0, bestWord = '';
   for (let i = 0; i < words.length; i++) {
     const w = words[i].toLowerCase().replace(/[^a-z]/g, '');
     if (w.length < 2) continue;
     const s = levenshteinSimilarity(w, t);
-    if (s > bestScore && s > 0.6) { bestScore = s; best = i; }
+    if (s > bestScore) { bestScore = s; best = i; bestWord = w; }
   }
-  return best >= 0 ? { idx: best, total: words.length } : null;
+  console.log(`%c[Match] 🔎 Strategy 4 (FUZZY): best="${bestWord}" sim=${bestScore.toFixed(3)} threshold=0.75`, 'color: #94a3b8; font-size: 10px');
+  if (best >= 0 && bestScore > 0.75) {
+    console.log(`%c[Match] ✅ Strategy 4 (FUZZY): "${bestWord}" ~ "${t}" sim=${bestScore.toFixed(3)} > 0.75`, 'color: #34d399');
+    return { idx: best, total: words.length };
+  }
+
+  console.log(`%c[Match] ❌ NO MATCH: best="${bestWord}" sim=${bestScore.toFixed(3)} < 0.75`, 'color: #f87171');
+  return null;
 }
 
 function levenshteinSimilarity(a: string, b: string): number {
@@ -138,27 +177,65 @@ export function useLiveAPI() {
   const skipNextAnalysisRef = useRef(false);        // true = AI is responding to Praat, don't re-analyze
   const isPraatResponseRef = useRef(false);           // true = current AI turn is a Praat feedback response (don't save as ref)
   const extractTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastPraatTimeRef = useRef(0);              // cooldown: last time runPraatAnalysis ran successfully
+  const praatDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);  // debounce for empty turnComplete → Praat trigger
 
   // ═══════════════════════════════════════════════
   // AI reference audio extraction (for Praat comparison)
+  // Uses text-based proportional mapping to find the target word's
+  // position in the audio — simpler and more accurate than real-time
+  // chunk tracking during streaming.
   // ═══════════════════════════════════════════════
 
-  function getRefChunksForWord(allChunks: string[], word: string | null): string[] {
+  function getRefChunksForWord(allChunks: string[], word: string | null, aiText: string): string[] {
     if (allChunks.length === 0) return [];
 
-    // AI typically says the target word at the END of its sentence
-    // e.g. "Now let's practice the word — analyze" → "analyze" is at the end
-    // At 24kHz, each chunk ≈ 0.04s → 75 chunks ≈ 3s (enough for any single word)
-    const MAX_REF_CHUNKS = 75;  // ~3 seconds
+    // At 24kHz, each chunk ≈ 0.04s
+    const WORD_WINDOW = 50;  // ~2 seconds window
 
-    if (allChunks.length <= MAX_REF_CHUNKS) {
-      console.log(`%c[Praat] 📤 Ref: ${allChunks.length} chunks (~${(allChunks.length * 0.04).toFixed(1)}s) for "${word || 'unknown'}"`, 'color: #818cf8');
+    // Short enough — use all without trimming
+    if (allChunks.length <= WORD_WINDOW) {
+      console.log(`%c[Praat] 📤 Ref: ALL ${allChunks.length} chunks (~${(allChunks.length * 0.04).toFixed(1)}s) for "${word || 'unknown'}"`, 'color: #818cf8');
       return allChunks;
     }
 
-    // Take last ~3 seconds where the target word is most likely spoken
-    const refChunks = allChunks.slice(-MAX_REF_CHUNKS);
-    console.log(`%c[Praat] 📤 Ref: last ${refChunks.length}/${allChunks.length} chunks (~${(refChunks.length * 0.04).toFixed(1)}s) for "${word || 'unknown'}"`, 'color: #818cf8');
+    // ── Text-based position estimation ──
+    // Find the target word in the saved AI transcript and map its text
+    // position proportionally to chunk position.
+    // e.g. "Now repeat after me... analyze" → "analyze" at 82% of text → chunk 82%
+    if (word && aiText) {
+      const textLower = aiText.toLowerCase();
+      const wordLower = word.toLowerCase();
+      // Use lastIndexOf — if the word appears multiple times, the last occurrence
+      // (closest to "repeat after me [word]") is most likely the pronunciation model
+      const wordPos = textLower.lastIndexOf(wordLower);
+
+      if (wordPos >= 0) {
+        // Map text position to chunk position proportionally
+        // Use the END of the word in text to estimate when the AI finished saying it
+        const wordEndInText = wordPos + wordLower.length;
+        const textRatio = wordEndInText / aiText.length;
+        const estimatedChunkEnd = Math.round(allChunks.length * textRatio);
+
+        // Window ends after the estimated word position (+15 chunks padding for trailing audio)
+        const windowEnd = Math.min(allChunks.length, estimatedChunkEnd + 15);
+        const start = Math.max(0, windowEnd - WORD_WINDOW);
+        const end = Math.min(allChunks.length, start + WORD_WINDOW);
+
+        const refChunks = allChunks.slice(start, end);
+        console.log(
+          `%c[Praat] 📤 Ref: SMART ${refChunks.length} chunks [${start}..${end}) (~${(refChunks.length * 0.04).toFixed(1)}s) | ` +
+          `"${word}" at text pos ${wordPos}/${aiText.length} (${(textRatio * 100).toFixed(0)}%) → est chunk ${estimatedChunkEnd}/${allChunks.length}`,
+          'color: #818cf8; font-weight: bold'
+        );
+        return refChunks;
+      }
+    }
+
+    // ── Fallback: take last chunks (word not found in text) ──
+    const MAX_FALLBACK = 75;  // ~3 seconds
+    const refChunks = allChunks.slice(-MAX_FALLBACK);
+    console.log(`%c[Praat] 📤 Ref: FALLBACK last ${refChunks.length}/${allChunks.length} chunks (~${(refChunks.length * 0.04).toFixed(1)}s) for "${word || 'unknown'}"`, 'color: #818cf8');
     return refChunks;
   }
 
@@ -170,55 +247,117 @@ export function useLiveAPI() {
     const proc = processorRef.current;
     if (!proc) return;
 
-    // ── Check 1: Has audio? ──
-    if (!proc.hasUserAudio()) {
-      console.log('%c[Praat] ⏭️ Skip — no user audio buffered', 'color: #888');
+    // ── Cooldown: prevent rapid re-triggering (5s) ──
+    const now = Date.now();
+    const elapsed = now - lastPraatTimeRef.current;
+    if (elapsed < 5000) {
+      dbg('praat', `⏭️ runPraatAnalysis: Skip — cooldown (${(elapsed / 1000).toFixed(1)}s < 5s since last run)`);
       return;
     }
 
-    let userChunks = proc.flushUserBuffer();
-    if (userChunks.length === 0) return;
+    // ── Check 1: Has audio? ──
+    if (!proc.hasUserAudio()) {
+      dbg('praat', '⏭️ runPraatAnalysis: Skip — no user audio buffered');
+      return;
+    }
 
     const sampleRate = proc.getSampleRate();
     const target = targetWordRef.current;
     const rawUserText = userTranscriptRef.current.trim();
-    userTranscriptRef.current = '';
-
-    // ── Cap max user buffer: keep only last ~10 seconds ──
-    // At 16kHz with 4096 samples/chunk, each chunk ≈ 0.256s → ~40 chunks = ~10s
-    // Server-side trimSilence will precisely remove silence, so we just set a generous upper bound
-    const MAX_USER_CHUNKS = 40;
-    if (userChunks.length > MAX_USER_CHUNKS) {
-      console.log(`%c[Praat] ✂️ User buffer too long (${userChunks.length} chunks, ~${(userChunks.length * 4096 / sampleRate).toFixed(1)}s) — trimming to last ${MAX_USER_CHUNKS} chunks (~10s)`, 'color: #f59e0b');
-      userChunks = userChunks.slice(-MAX_USER_CHUNKS);
-    }
 
     // ── Check 2: Do we have a target word? ──
     if (!target) {
-      console.log('%c[Praat] ⏭️ Skip — no target word set yet', 'color: #888');
+      dbg('praat', '⏭️ Skip — no target word set yet');
       setRecognizedSpeech(null);
+      const stats = processorRef.current?.getBufferStats();
+      dbg('buffer', `🗑️ CLEAR (no target): ${stats?.chunks ?? 0} chunks discarded`);
+      processorRef.current?.clearUserBuffer();
+      dbgUpdateState({ userChunkCount: 0, bufferMemoryKB: 0, bufferDurationSec: 0, bufferClearCount: dbgGetState().bufferClearCount + 1 });
       return;
     }
 
     // ── Check 3: Did user say the target word? ──
     const cleanUserText = rawUserText.replace(/[^a-zA-Z\s]/g, '').trim();
+    dbg('match', `🔍 Matching: userText="${cleanUserText}" vs target="${target}"`);
+    let matchResult: { idx: number; total: number } | null = null;
     if (cleanUserText.length >= 2) {
-      const match = findWordInText(cleanUserText, target);
-      if (!match) {
-        console.log(`%c[Praat] ⏭️ Skip — "${cleanUserText}" ≠ "${target}"`, 'color: #f59e0b; font-weight: bold');
+      matchResult = findWordInText(cleanUserText, target);
+      if (!matchResult) {
+        dbg('match', `❌ MISMATCH: "${cleanUserText}" ≠ "${target}" — skipping analysis`);
+        dbgUpdateState({ lastMatchResult: `MISMATCH: "${cleanUserText}" ≠ "${target}"` });
         setRecognizedSpeech(null);
         setSpeechMismatch(true);
-        // Auto-clear after 3 seconds
         setTimeout(() => setSpeechMismatch(false), 3000);
+        userTranscriptRef.current = '';  // clear stale text to avoid contaminating next match
         return;
       }
       // Matched!
+      dbg('match', `✅ MATCHED: "${cleanUserText}" contains "${target}" at idx=${matchResult.idx}/${matchResult.total}`);
+      dbgUpdateState({ lastMatchResult: `MATCHED: "${cleanUserText}" contains "${target}"` });
       setRecognizedSpeech(cleanUserText);
       setSpeechMismatch(false);
     } else {
-      console.log('%c[Praat] ⏭️ Skip — no usable speech detected', 'color: #888');
+      dbg('praat', `⏭️ Skip — no usable speech (cleanUserText="${cleanUserText}", len=${cleanUserText.length})`);
       setRecognizedSpeech(null);
+      // DON'T clear buffer here — keep audio for next trigger attempt
       return;
+    }
+
+    // ── Match succeeded! Now flush audio and clear transcript ──
+    lastPraatTimeRef.current = Date.now(); // start cooldown
+    let userChunks = proc.flushUserBuffer();
+    if (userChunks.length === 0) return;
+    userTranscriptRef.current = '';
+    const flushMemKB = (userChunks.length * 8192 / 1024);
+    const flushDurSec = (userChunks.length * 4096 / sampleRate);
+    dbg('buffer', `📤 FLUSH: ${userChunks.length} chunks (${flushDurSec.toFixed(1)}s, ${flushMemKB.toFixed(0)}KB) — transcript cleared`);
+    dbg('praat', `🎤 Flushed user buffer: ${userChunks.length} chunks, transcript cleared`);
+    dbgUpdateState({
+      userChunkCount: 0,
+      bufferMemoryKB: 0,
+      bufferDurationSec: 0,
+      bufferFlushCount: dbgGetState().bufferFlushCount + 1
+    });
+
+    // ── Smart trimming: End-Anchored Activity Window ──
+    // If the user buffer is huge (e.g. 90s), it's likely because they had the mic open
+    // without speaking for a long time. The actual sentence was spoken at the END.
+    // Global proportional mapping (idx/total * totalChunks) fails completely if there's long silence.
+    // Solution: We extract a generous window (up to 30s) from the END of the active audio.
+    const MAX_USER_CHUNKS = 100;    // ~25.6s at 4096/16000
+    const ACTIVE_SENTENCE_CHUNKS = Math.min(userChunks.length, 120); // ~30s max of recent activity
+
+    if (userChunks.length > MAX_USER_CHUNKS) {
+      const totalChunks = userChunks.length;
+
+      // Assume the spoken sentence occupies the last ACTIVE_SENTENCE_CHUNKS.
+      // We map the word position ratio within this active tail, NOT the whole 90s buffer.
+      const wordRatio = matchResult.total > 1 ? matchResult.idx / matchResult.total : 0.5;
+
+      // The start of the active tail:
+      const activeTailStart = totalChunks - ACTIVE_SENTENCE_CHUNKS;
+
+      // Where in the active tail is the word?
+      const estimatedCenter = activeTailStart + Math.floor(wordRatio * ACTIVE_SENTENCE_CHUNKS);
+      const halfWindow = Math.floor(MAX_USER_CHUNKS / 2);
+
+      // Center the window around estimatedCenter, clamp to valid bounds
+      let startChunk = Math.max(0, estimatedCenter - halfWindow);
+      let endChunk = startChunk + MAX_USER_CHUNKS;
+
+      // If we hit the end of the buffer, shift the window left
+      if (endChunk > totalChunks) {
+        endChunk = totalChunks;
+        startChunk = Math.max(0, endChunk - MAX_USER_CHUNKS);
+      }
+
+      dbg('audio', `✂️ User buffer too long: ${totalChunks} chunks (~${(totalChunks * 4096 / sampleRate).toFixed(1)}s)`);
+      dbg('audio', `✂️ Target "${target}" at word ${matchResult.idx}/${matchResult.total} (${(wordRatio * 100).toFixed(0)}%) of active tail`);
+      dbg('audio', `✂️ Trimming to chunks [${startChunk}..${endChunk}) = ${endChunk - startChunk} chunks (~${((endChunk - startChunk) * 4096 / sampleRate).toFixed(1)}s)`);
+
+      userChunks = userChunks.slice(startChunk, endChunk);
+    } else {
+      dbg('audio', `📦 User buffer OK: ${userChunks.length} chunks (~${(userChunks.length * 4096 / sampleRate).toFixed(1)}s)`);
     }
 
     // Send all user chunks to server — Whisper handles alignment there
@@ -243,13 +382,17 @@ export function useLiveAPI() {
       let score: PronunciationScore | null = null;
       if (d1.status === 'success') {
         score = d1.score;
-        console.log(`%c[Praat] ✅ Done (${((performance.now() - t0) / 1000).toFixed(2)}s) — Overall: ${score!.overall}`, 'color: #34d399; font-weight: bold');
+        dbg('praat', `✅ Analysis done (${((performance.now() - t0) / 1000).toFixed(2)}s) — Overall: ${score!.overall}`);
+      } else {
+        dbg('error', `Praat analysis returned non-success:`, d1);
       }
 
       // ── Step 2: Compare with AI reference ──
       if (score && lastAiChunksRef.current.length > 0) {
-        const refChunks = getRefChunksForWord(lastAiChunksRef.current, target);
+        dbg('audio', `🔄 Comparing with ref: ${lastAiChunksRef.current.length} total ref chunks, target="${target}"`);
+        const refChunks = getRefChunksForWord(lastAiChunksRef.current, target, lastAiTextRef.current);
         if (refChunks.length > 0) {
+          dbg('audio', `📤 Sending compare: ref=${refChunks.length} chunks (~${(refChunks.length * 0.04).toFixed(1)}s), user=${chunks.length} chunks`);
           const r2 = await fetch('/api/compare-pronunciation', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -258,14 +401,37 @@ export function useLiveAPI() {
           const d2 = await r2.json();
           if (d2.status === 'success') {
             score.comparison = d2.comparison;
-            console.log(`%c[Praat] ✅ Similarity: ${d2.comparison.overallSimilarity}%`, 'color: #34d399');
+            dbg('praat', `✅ Similarity: ${d2.comparison.overallSimilarity}% | MFCC: ${d2.comparison.mfccScore} | audioTimestamp: ${d2.comparison.audioTimestamp}`);
+          } else {
+            dbg('error', 'Compare returned non-success:', d2);
           }
         }
+      } else {
+        dbg('audio', `⏭️ No comparison — refChunks=${lastAiChunksRef.current.length}, score=${!!score}`);
       }
 
       // ── Step 3: Update UI + send to AI ──
       if (score) {
         setPronunciationScore(score);
+
+        // ── Save to pronunciation history DB ──
+        fetch('/api/pronunciation-history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            word: target,
+            scores: {
+              overall: score.overall,
+              pitchStability: score.pitchStability,
+              vowelClarity: score.vowelClarity,
+              voiceQuality: score.voiceQuality,
+              fluency: score.fluency,
+            },
+            comparison: score.comparison || null,
+            category: 'general',
+            matched: true,
+          }),
+        }).catch(err => console.warn('[DB] Save failed:', err));
 
         const comp = score.comparison;
         const lines = [
@@ -297,21 +463,27 @@ export function useLiveAPI() {
         );
 
         if (sessionRef.current) {
-          console.log('%c[Praat] 📤 Sending to AI...', 'color: #f472b6; font-weight: bold; font-size: 13px');
+          dbg('praat', '📤 Sending [PRONUNCIATION_ANALYSIS_RESULT] to AI...');
+          dbg('praat', `  skipNextAnalysis will be set to TRUE`);
           skipNextAnalysisRef.current = true;
+          dbgUpdateState({ skipNextAnalysis: true });
           try {
             await sessionRef.current.sendClientContent({
               turns: [{ role: 'user', parts: [{ text: lines.join('\n') }] }],
               turnComplete: true,
             });
-            console.log('%c[Praat] ✅ Sent', 'color: #34d399');
+            dbg('praat', '✅ Praat result sent to AI successfully');
           } catch (err) {
-            console.error('[Praat] ❌ Send failed:', err);
+            dbg('error', '💥 Failed to send Praat result to AI:', err);
             skipNextAnalysisRef.current = false;
+            dbgUpdateState({ skipNextAnalysis: false });
           }
+        } else {
+          dbg('error', '⚠️ Cannot send Praat result — no active session!');
         }
       }
     } catch (err) {
+      dbg('error', '💥 runPraatAnalysis FAILED:', err);
       console.error('[Praat] ❌ Analysis failed:', err);
     } finally {
       setIsAnalyzing(false);
@@ -324,10 +496,22 @@ export function useLiveAPI() {
 
   const connect = useCallback(async (systemInstruction: string) => {
     try {
+      dbg('flow', '🚀 CONNECT: Initializing session...');
+      dbgUpdateState({ sessionActive: true, turnCount: 0, analysisCount: 0, errorCount: 0 });
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       processorRef.current = new AudioProcessor();
       playerRef.current = new AudioPlayer((v) => setVolume(v));
       processorRef.current.setBuffering(false); // start with buffering OFF (AI will speak first)
+      // Register buffer stats callback for debug monitoring
+      processorRef.current.setOnBufferUpdate((stats) => {
+        dbgUpdateState({
+          userChunkCount: stats.chunks,
+          bufferMemoryKB: stats.memoryKB,
+          bufferDurationSec: stats.durationSec,
+          bufferPeakChunks: stats.peak,
+        });
+      });
+      dbg('audio', 'AudioProcessor & AudioPlayer created, buffering OFF');
 
       const session = await ai.live.connect({
         model: "gemini-2.5-flash-native-audio-preview-09-2025",
@@ -341,6 +525,7 @@ export function useLiveAPI() {
         callbacks: {
           // ────────────────────────────
           onopen: () => {
+            dbg('flow', '✅ CONNECTED: WebSocket open, starting mic recording');
             setIsConnected(true);
             setError(null);
             processorRef.current?.startRecording((base64) => {
@@ -360,7 +545,17 @@ export function useLiveAPI() {
               // ── First chunk of a new AI turn ──
               if (!aiTurnActiveRef.current) {
                 aiTurnActiveRef.current = true;
+                dbgUpdateState({ aiTurnActive: true });
+                dbg('flow', `═══ AI TURN START ═══ target="${targetWordRef.current}" skipAnalysis=${skipNextAnalysisRef.current} isPraatResp=${isPraatResponseRef.current}`);
                 if (extractTimerRef.current) { clearTimeout(extractTimerRef.current); extractTimerRef.current = null; }
+
+                // Cancel any pending debounce — AI speaking means user is done
+                if (praatDebounceRef.current) {
+                  dbg('buffer', `⏳ Debounce CANCELLED — AI started speaking`);
+                  clearTimeout(praatDebounceRef.current);
+                  praatDebounceRef.current = null;
+                  dbgUpdateState({ praatDebounceActive: false });
+                }
 
                 // Clear previous turn transcript for new turn
                 aiTranscriptRef.current = '';
@@ -369,17 +564,34 @@ export function useLiveAPI() {
                 if (skipNextAnalysisRef.current) {
                   skipNextAnalysisRef.current = false;
                   isPraatResponseRef.current = true;   // mark this turn as Praat feedback response
-                  console.log('%c[Praat] ⏭️ Skip — AI responding to Praat data (will NOT save ref audio)', 'color: #888');
+                  dbg('praat', '⏭️ Skip analysis — AI responding to Praat data (will NOT save ref audio)');
+                  dbgUpdateState({ skipNextAnalysis: false, isPraatResponse: true });
                 } else {
                   isPraatResponseRef.current = false;
-                  console.log('%c[Praat] 🤖 AI started → running analysis', 'color: #60a5fa; font-weight: bold');
-                  runPraatAnalysis();
+                  const userChunks = processorRef.current?.getUserChunkCount?.() ?? 0;
+                  const hasEnoughAudio = userChunks >= 3;
+                  dbg('praat', `AI started → userChunks=${userChunks}, hasEnough=${hasEnoughAudio}, target="${targetWordRef.current}", userText="${userTranscriptRef.current.trim().substring(0, 60)}"`);
+                  if (hasEnoughAudio) {
+                    dbg('praat', '🤖 AI started responding — triggering Praat analysis immediately');
+                    runPraatAnalysis();
+                  } else {
+                    dbg('praat', '⏭️ Skip — not enough user audio');
+                    const stats = processorRef.current?.getBufferStats();
+                    dbg('buffer', `🗑️ CLEAR (AI started, not enough audio): ${stats?.chunks ?? 0} chunks discarded`);
+                    processorRef.current?.clearUserBuffer();
+                    dbgUpdateState({ userChunkCount: 0, bufferMemoryKB: 0, bufferDurationSec: 0, bufferClearCount: dbgGetState().bufferClearCount + 1 });
+                    // Issue #012: Do NOT clear userTranscriptRef here!
+                    // The AI responded before enough audio was buffered, but inputTranscription
+                    // events are still valid. Clearing the transcript loses the target word.
+                  }
                 }
               }
 
               // ── Play + buffer ──
               setIsSpeaking(true);
               processorRef.current?.setBuffering(false);  // stop user buffering while AI plays
+              dbg('buffer', `🔴 Buffering OFF — AI speaking`);
+              dbgUpdateState({ isBuffering: false });
               processorRef.current?.addAiChunk(audio);
               playerRef.current?.play(audio);
             }
@@ -402,6 +614,8 @@ export function useLiveAPI() {
             if (outText) {
               aiTranscriptRef.current += ' ' + outText;
 
+
+
               // Skip target word extraction during Praat feedback turns
               if (!isPraatResponseRef.current) {
                 const full = aiTranscriptRef.current.replace(/\s+/g, ' ').trim();
@@ -410,11 +624,22 @@ export function useLiveAPI() {
                 const echoMatch = full.match(/repeat\s+after\s+me[,.\s…—:;-]*(\w{3,})/i);
                 if (echoMatch) {
                   const detected = echoMatch[1].toLowerCase();
+
                   if (detected !== targetWordRef.current) {
-                    console.log(`%c[Echo] 🎯 Target word DETECTED: "${targetWordRef.current}" → "${detected}" — clearing ref`, 'color: #34d399; font-weight: bold');
+                    dbg('match', `🎯 Target word CHANGED via echo: "${targetWordRef.current}" → "${detected}"`);
+                    dbgUpdateState({ targetWord: detected, lastRefChunkCount: 0, refClearedByWordChange: dbgGetState().refClearedByWordChange + 1, lastRefAction: `CLEARED: word → "${detected}"`, lastRefTimestamp: Date.now() });
+                    console.log(`%c[Echo] 🎯 Target word CHANGED: "${targetWordRef.current}" → "${detected}" — clearing ref`, 'color: #34d399; font-weight: bold');
                     targetWordRef.current = detected;
                     setCurrentTargetWord(detected);
-                    lastAiChunksRef.current = [];
+                    lastAiChunksRef.current = [];  // clear ref only for NEW word
+
+                    // Critical fix: If AI changed the target word during a Praat response turn,
+                    // this turn is no longer just feedback — it's a new drill prompt!
+                    // We MUST NOT discard its audio at turnComplete.
+                    isPraatResponseRef.current = false;
+                    dbgUpdateState({ isPraatResponse: false });
+                  } else {
+                    dbg('match', `🎯 Target word SAME: "${detected}" — keeping existing ref (${lastAiChunksRef.current.length} chunks)`);
                   }
                   // Cancel any pending DeepSeek call — we already have the word
                   if (extractTimerRef.current) { clearTimeout(extractTimerRef.current); extractTimerRef.current = null; }
@@ -428,11 +653,13 @@ export function useLiveAPI() {
                     const recheck = fullText.match(/repeat\s+after\s+me[,.\s…—:;-]*(\w{3,})/i);
                     if (recheck) {
                       const w = recheck[1].toLowerCase();
+
                       if (w !== targetWordRef.current) {
                         console.log(`%c[Echo] 🎯 Target word (delayed): "${w}"`, 'color: #34d399; font-weight: bold');
                         targetWordRef.current = w;
                         setCurrentTargetWord(w);
                         lastAiChunksRef.current = [];
+                        dbgUpdateState({ targetWord: w, lastRefChunkCount: 0, refClearedByWordChange: dbgGetState().refClearedByWordChange + 1, lastRefAction: `CLEARED: word → "${w}" (delayed)`, lastRefTimestamp: Date.now() });
                       }
                       return;
                     }
@@ -444,6 +671,7 @@ export function useLiveAPI() {
                           targetWordRef.current = w;
                           setCurrentTargetWord(w);
                           lastAiChunksRef.current = [];
+                          dbgUpdateState({ targetWord: w, lastRefChunkCount: 0, refClearedByWordChange: dbgGetState().refClearedByWordChange + 1, lastRefAction: `CLEARED: word → "${w}" (DeepSeek)`, lastRefTimestamp: Date.now() });
                         } else if (w) {
                           console.log(`%c[DeepSeek] ✅ Target word confirmed: "${w}"`, 'color: #38bdf8');
                         }
@@ -458,54 +686,124 @@ export function useLiveAPI() {
             // ║  Turn complete             ║
             // ╚═══════════════════════════╝
             if (msg.serverContent?.turnComplete) {
+              const isEmptyTurn = !aiTurnActiveRef.current;
+              dbg('flow', `═══ AI TURN COMPLETE ═══ isEmptyTurn=${isEmptyTurn} isPraatResp=${isPraatResponseRef.current} aiTranscript="${aiTranscriptRef.current.trim().substring(0, 80)}..."`);
+
               setIsSpeaking(false);
               aiTurnActiveRef.current = false;
+              dbgUpdateState({ aiTurnActive: false });
 
-              // Save AI reference audio for Praat comparison
-              // BUT skip saving if this turn was a Praat feedback response (short feedback audio, not a new word)
-              if (isPraatResponseRef.current) {
-                // Flush AI buffer to discard feedback audio, but don't overwrite the reference
-                if (processorRef.current?.hasAiAudio()) {
-                  processorRef.current.flushAiBuffer();
-                  console.log(`%c[Audio] 🗑️ Discarded Praat feedback audio (keeping previous ref)`, 'color: #888');
-                }
-                isPraatResponseRef.current = false;
-              } else if (processorRef.current?.hasAiAudio()) {
-                const newChunks = processorRef.current.flushAiBuffer();
-                const existingLen = lastAiChunksRef.current.length;
+              if (isEmptyTurn) {
+                // The AI didn't output audio this turn. 
+                // Because of our strict system prompt, it often waits silently for Praat analysis results!
+                const userChunks = processorRef.current?.getUserChunkCount?.() ?? 0;
+                const cleanUserText = userTranscriptRef.current.replace(/[^a-zA-Z\s]/g, '').trim();
 
-                // Only overwrite ref if:
-                // (a) we don't have a ref yet, or
-                // (b) the new turn has MORE chunks (= new substantial teaching turn)
-                // This prevents short "try again" turns from overwriting the original teaching ref
-                if (existingLen === 0 || newChunks.length > existingLen) {
-                  lastAiChunksRef.current = newChunks;
-                  lastAiTextRef.current = aiTranscriptRef.current.replace(/\s+/g, ' ').trim();
-                  console.log(`%c[Audio] 💾 ${newChunks.length} AI ref chunks saved (replaced ${existingLen})`, 'color: #818cf8');
+                if (userChunks >= 3 && targetWordRef.current && cleanUserText.length > 0) {
+                  // Issue #013: Don't trigger immediately! Gemini sends empty turnCompletes
+                  // while user is still mid-sentence. Use a 2s debounce so we capture
+                  // the full utterance. Each new empty turnComplete resets the timer.
+                  // The timer is cancelled and Praat triggered immediately when AI actually
+                  // starts responding (= reliable signal user stopped speaking).
+                  if (praatDebounceRef.current) clearTimeout(praatDebounceRef.current);
+                  dbg('praat', `⏳ Empty turn with speech detected — setting 2s debounce (chunks=${userChunks}, text="${cleanUserText.substring(0, 40)}")`);
+                  dbgUpdateState({ praatDebounceActive: true });
+                  praatDebounceRef.current = setTimeout(() => {
+                    praatDebounceRef.current = null;
+                    dbgUpdateState({ praatDebounceActive: false });
+                    const currentChunks = processorRef.current?.getUserChunkCount?.() ?? 0;
+                    const currentText = userTranscriptRef.current.replace(/[^a-zA-Z\s]/g, '').trim();
+                    if (currentChunks >= 3 && currentText.length > 0) {
+                      dbg('praat', `🤖 Debounce fired — user likely finished (chunks=${currentChunks}, text="${currentText.substring(0, 40)}")`);
+                      runPraatAnalysis();
+                    } else {
+                      dbg('praat', `⏭️ Debounce fired but conditions no longer met (chunks=${currentChunks}, text="${currentText.substring(0, 20)}"`);
+                    }
+                  }, 2000);
+                } else if (!targetWordRef.current) {
+                  // No active pronunciation drill — safe to clear buffer
+                  dbg('audio', '⏭️ Empty turn, no target word. Clearing user buffer.');
+                  const stats = processorRef.current?.getBufferStats();
+                  dbg('buffer', `🗑️ CLEAR (empty turn, no target): ${stats?.chunks ?? 0} chunks discarded`);
+                  processorRef.current?.clearUserBuffer();
+                  userTranscriptRef.current = '';
+                  dbgUpdateState({ userChunkCount: 0, bufferMemoryKB: 0, bufferDurationSec: 0, bufferClearCount: dbgGetState().bufferClearCount + 1 });
                 } else {
-                  console.log(`%c[Audio] ⏭️ Keeping existing ref (${existingLen} chunks) — new turn only had ${newChunks.length} chunks`, 'color: #94a3b8');
+                  // Target word is set but user hasn't spoken yet (or transcript not accumulated)
+                  // DO NOT clear buffer — keep accumulating audio until user speaks!
+                  // (Issue #011: clearing here discards user speech captured between empty turnCompletes)
+                  dbg('audio', `⏭️ Empty turn — keeping buffer (${userChunks} chunks) waiting for user speech. target="${targetWordRef.current}" text="${cleanUserText.substring(0, 40)}"`);
                 }
+              } else {
+                // It was a real AI turn. Save AI reference audio for Praat comparison
+                // BUT skip saving if this turn was a Praat feedback response (short feedback audio, not a new word)
+                if (isPraatResponseRef.current) {
+                  // Flush AI buffer to discard feedback audio, but don't overwrite the reference
+                  if (processorRef.current?.hasAiAudio()) {
+                    const discardedLen = processorRef.current.flushAiBuffer().length;
+                    dbg('audio', `🗑️ Discarded Praat feedback audio (${discardedLen} chunks) — keeping previous ref (${lastAiChunksRef.current.length} chunks)`);
+                    dbgUpdateState({ refDiscardedCount: dbgGetState().refDiscardedCount + 1, lastRefAction: `DISCARDED: ${discardedLen} feedback chunks`, lastRefTimestamp: Date.now() });
+                  }
+                  isPraatResponseRef.current = false;
+                  dbgUpdateState({ isPraatResponse: false });
+                } else if (processorRef.current?.hasAiAudio()) {
+                  const newChunks = processorRef.current.flushAiBuffer();
+                  const existingLen = lastAiChunksRef.current.length;
+
+                  if (existingLen === 0 || newChunks.length > existingLen) {
+                    lastAiChunksRef.current = newChunks;
+                    lastAiTextRef.current = aiTranscriptRef.current.replace(/\s+/g, ' ').trim();
+                    dbg('audio', `💾 REF SAVED: ${newChunks.length} chunks (~${(newChunks.length * 0.04).toFixed(1)}s) replaced ${existingLen} | text="${lastAiTextRef.current.substring(0, 80)}"`);
+                    dbgUpdateState({ lastRefChunkCount: newChunks.length, aiChunkCount: newChunks.length, refSavedCount: dbgGetState().refSavedCount + 1, lastRefAction: `SAVED: ${newChunks.length} chunks (~${(newChunks.length * 0.04).toFixed(1)}s)`, lastRefTimestamp: Date.now() });
+                  } else {
+                    dbg('audio', `⏭️ REF KEPT: existing ${existingLen} chunks > new ${newChunks.length} chunks`);
+                    dbgUpdateState({ refKeptCount: dbgGetState().refKeptCount + 1, lastRefAction: `KEPT: existing ${existingLen} > new ${newChunks.length}`, lastRefTimestamp: Date.now() });
+                  }
+                } else {
+                  dbg('audio', '⚠️ Turn complete but NO AI audio in buffer');
+                }
+
+                // Clear user buffer after AI's full turn, getting ready for user
+                const turnEndStats = processorRef.current?.getBufferStats();
+                dbg('buffer', `🗑️ CLEAR (AI turn complete): ${turnEndStats?.chunks ?? 0} chunks discarded — ready for next user turn`);
+                processorRef.current?.clearUserBuffer();
+                dbgUpdateState({ userChunkCount: 0, bufferMemoryKB: 0, bufferDurationSec: 0, bufferClearCount: dbgGetState().bufferClearCount + 1 });
+                // Cancel any pending debounce since AI just finished a real turn
+                if (praatDebounceRef.current) { clearTimeout(praatDebounceRef.current); praatDebounceRef.current = null; dbgUpdateState({ praatDebounceActive: false }); }
               }
 
-              // Start buffering user audio for next analysis
-              processorRef.current?.clearUserBuffer();
+              // Always ensure buffering is ON while waiting
               processorRef.current?.setBuffering(true);
-              console.log('%c[Audio] ⏺️ Buffering ON — waiting for user', 'color: #34d399');
+              dbg('buffer', `🟢 Buffering ON — waiting for user speech`);
+              dbg('audio', '⏺️ Buffering ON — waiting for user speech');
+              dbgUpdateState({ isBuffering: true, userChunkCount: 0 });
             }
 
             // ╔═══════════════════════════╗
             // ║  Interrupted               ║
             // ╚═══════════════════════════╝
             if (msg.serverContent?.interrupted) {
+              dbg('flow', '⚡ INTERRUPTED by user — stopping AI, clearing buffers');
               playerRef.current?.stop();
               setIsSpeaking(false);
               aiTurnActiveRef.current = false;
+              const intStats = processorRef.current?.getBufferStats();
+              dbg('buffer', `🗑️ CLEAR (interrupted): ${intStats?.chunks ?? 0} user chunks discarded`);
               processorRef.current?.clearUserBuffer();
               processorRef.current?.clearAiBuffer();
               processorRef.current?.setBuffering(true);
-              userTranscriptRef.current = '';
+              dbg('buffer', `⏺️ Buffering ON after interrupt`);
+              dbgUpdateState({ userChunkCount: 0, bufferMemoryKB: 0, bufferDurationSec: 0, bufferClearCount: dbgGetState().bufferClearCount + 1 });
+              // Issue #012: Only clear transcript when NOT in a pronunciation drill.
+              // During drill, user may interrupt AI while speaking their sentence —
+              // clearing transcript here would lose the beginning of their utterance.
+              if (!targetWordRef.current) {
+                userTranscriptRef.current = '';
+              } else {
+                dbg('audio', `⚡ Interrupted — keeping transcript for drill: "${userTranscriptRef.current.trim().substring(0, 50)}"`);
+              }
               aiTranscriptRef.current = '';
-              console.log('%c[Audio] ⚡ Interrupted', 'color: #f59e0b');
+              dbgUpdateState({ aiTurnActive: false, isBuffering: true, userChunkCount: 0, aiChunkCount: 0 });
             }
 
             // ╔═══════════════════════════╗
@@ -514,18 +812,36 @@ export function useLiveAPI() {
             const inText = (msg as any).serverContent?.inputTranscription?.text;
             if (inText) {
               userTranscriptRef.current += ' ' + inText;
+              dbg('match', `👤 User said: "${inText}" | accumulated: "${userTranscriptRef.current.trim().substring(0, 80)}" | target="${targetWordRef.current}"`);
               console.log(`%c[User] 👤 "${inText}"`, 'color: #fbbf24');
             }
           },
 
           // ────────────────────────────
-          onclose: () => {
+          onclose: (ev: any) => {
+            const code = ev?.code ?? ev?.closeCode ?? 'unknown';
+            const reason = ev?.reason ?? ev?.closeReason ?? '';
+            dbg('flow', `🔌 ONCLOSE: WebSocket closed — code=${code} reason="${reason}"`);
+            console.error(`[Live API] WebSocket closed: code=${code}, reason=${reason}`, ev);
+            dbgUpdateState({ sessionActive: false });
+            if (reason.toLowerCase().includes('resource_exhausted') || reason.toLowerCase().includes('quota')) {
+              setError('Gemini API 額度已用完，請等幾分鐘再試。');
+            } else if (code !== 1000 && code !== 'unknown') {
+              setError(`連線被關閉 (code=${code}): ${reason || '未知原因'}`);
+            }
             setIsConnected(false);
             processorRef.current?.stopRecording();
           },
-          onerror: (err) => {
-            console.error("Live API Error:", err);
-            setError("Connection error.");
+          onerror: (err: any) => {
+            const msg = err?.message || err?.error?.message || JSON.stringify(err) || String(err);
+            dbg('error', `💥 ONERROR: WebSocket error — ${msg}`, err);
+            console.error("[Live API] Error details:", err);
+            dbgUpdateState({ sessionActive: false, lastError: msg });
+            if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota')) {
+              setError('Gemini API 額度已用完，請等幾分鐘再試。');
+            } else {
+              setError(`連線錯誤: ${msg.substring(0, 120)}`);
+            }
             setIsConnected(false);
           }
         }
@@ -533,6 +849,8 @@ export function useLiveAPI() {
 
       sessionRef.current = session;
     } catch (err) {
+      dbg('error', '💥 CONNECT FAILED:', err);
+      dbgUpdateState({ sessionActive: false, lastError: String(err) });
       console.error("Connect failed:", err);
       setError("Failed to initialize.");
     }
@@ -543,9 +861,13 @@ export function useLiveAPI() {
   // ═══════════════════════════════════════════════
 
   const disconnect = useCallback(() => {
+    dbg('flow', '🛑 DISCONNECT: User-initiated disconnect');
+    dbgUpdateState({ sessionActive: false });
     sessionRef.current?.close();
     processorRef.current?.stopRecording();
     playerRef.current?.stop();
+    if (praatDebounceRef.current) { clearTimeout(praatDebounceRef.current); praatDebounceRef.current = null; }
+    if (extractTimerRef.current) { clearTimeout(extractTimerRef.current); extractTimerRef.current = null; }
     setIsConnected(false);
     setIsSpeaking(false);
   }, []);
@@ -557,18 +879,18 @@ export function useLiveAPI() {
 
   // ── AI playback control (pause/resume when user plays comparison audio) ──
   const pauseAI = useCallback(async () => {
-    // Mute mic completely — prevents playback audio from reaching Gemini
+    dbg('flow', '⏸️ PAUSE AI: Muting mic + suspending playback');
+    dbgUpdateState({ isMuted: true, isBuffering: false });
     processorRef.current?.setMuted(true);
     processorRef.current?.setBuffering(false);
-    // Pause AI speech
     await playerRef.current?.suspend();
   }, []);
 
   const resumeAI = useCallback(async () => {
-    // Unmute mic and resume buffering
+    dbg('flow', '▶️ RESUME AI: Unmuting mic + resuming playback');
+    dbgUpdateState({ isMuted: false, isBuffering: true });
     processorRef.current?.setMuted(false);
     processorRef.current?.setBuffering(true);
-    // Resume AI speech
     await playerRef.current?.resume();
   }, []);
 

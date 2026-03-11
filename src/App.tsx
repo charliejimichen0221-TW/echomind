@@ -6,6 +6,7 @@ import { AudioVisualizer } from './components/AudioVisualizer';
 import { TalkingHead } from './components/TalkingHead';
 import { cn } from './utils/cn';
 import { generateDebaterImage } from './services/imageService';
+import { setupDebugHelpers } from './utils/debugLogger';
 
 const TRAINING_LEVELS = [
   { id: "daily", label: "Daily Conversation", description: "Common words used in everyday life." },
@@ -68,6 +69,11 @@ export default function App() {
     });
     setPlayingAudio(type);
   }, [stopAllPlayback, pauseAI, resumeAI]);
+
+  // ── Initialize debug logger ──
+  useEffect(() => {
+    setupDebugHelpers();
+  }, []);
 
   // Fetch initial progress
   useEffect(() => {
@@ -218,7 +224,16 @@ export default function App() {
     
     Start by introducing yourself and the first word for the "${levelInfo?.label}" level.`;
 
-    await connect(systemInstruction);
+    try {
+      await connect(systemInstruction);
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      if (msg.includes('RESOURCE_EXHAUSTED')) {
+        setError('Gemini API 額度已用完，請等幾分鐘再試。');
+      } else {
+        setError(`連線失敗: ${msg.substring(0, 100)}`);
+      }
+    }
     setIsStarting(false);
   };
 

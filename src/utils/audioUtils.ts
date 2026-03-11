@@ -21,6 +21,8 @@ export class AudioProcessor {
   private isMuted = false;  // When true, stops ALL audio output (to Gemini AND buffer)
   private userBuffer: string[] = [];
   private aiBuffer: string[] = [];
+  private peakChunks = 0;
+  private onBufferUpdate?: (stats: { chunks: number; memoryKB: number; durationSec: number; peak: number }) => void;
 
   async startRecording(onChunk: (base64: string) => void) {
     this.audioContext = new AudioContext({ sampleRate: 16000 });
@@ -42,6 +44,11 @@ export class AudioProcessor {
       onChunk(base64);
       if (this.isBuffering) {
         this.userBuffer.push(base64);
+        if (this.userBuffer.length > this.peakChunks) this.peakChunks = this.userBuffer.length;
+        // Fire buffer update callback every 10 chunks to avoid spam
+        if (this.userBuffer.length % 10 === 0 && this.onBufferUpdate) {
+          this.onBufferUpdate(this.getBufferStats());
+        }
       }
     };
 
@@ -57,15 +64,33 @@ export class AudioProcessor {
 
   // ── Buffering control ──
   setBuffering(on: boolean) { this.isBuffering = on; }
+  getIsBuffering(): boolean { return this.isBuffering; }
   // ── Mute control (stops ALL audio: Gemini + buffer) ──
   setMuted(muted: boolean) { this.isMuted = muted; }
   hasUserAudio(): boolean { return this.userBuffer.length > 0; }
+  getUserChunkCount(): number { return this.userBuffer.length; }
   clearUserBuffer() { this.userBuffer = []; }
   flushUserBuffer(): string[] { const b = [...this.userBuffer]; this.userBuffer = []; return b; }
+
+  // ── Buffer stats for debug monitoring ──
+  setOnBufferUpdate(cb: (stats: { chunks: number; memoryKB: number; durationSec: number; peak: number }) => void) {
+    this.onBufferUpdate = cb;
+  }
+  getBufferStats() {
+    const sampleRate = this.audioContext?.sampleRate ?? 16000;
+    return {
+      chunks: this.userBuffer.length,
+      memoryKB: this.userBuffer.length * 8192 / 1024,
+      durationSec: this.userBuffer.length * 4096 / sampleRate,
+      peak: this.peakChunks,
+    };
+  }
+  resetPeakChunks() { this.peakChunks = 0; }
 
   // ── AI reference audio ──
   addAiChunk(base64: string) { this.aiBuffer.push(base64); }
   hasAiAudio(): boolean { return this.aiBuffer.length > 0; }
+  getAiChunkCount(): number { return this.aiBuffer.length; }
   clearAiBuffer() { this.aiBuffer = []; }
   flushAiBuffer(): string[] { const b = [...this.aiBuffer]; this.aiBuffer = []; return b; }
 

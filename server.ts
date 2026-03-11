@@ -12,6 +12,10 @@ const PORT = 3000;
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 
+// ===== Data directory setup =====
+const DATA_DIR = path.join(process.cwd(), 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
 // In-memory database for demo purposes
 interface MasteryRecord {
   word: string;
@@ -102,6 +106,126 @@ app.post('/api/score', (req, res) => {
   });
 });
 
+// ===== Pronunciation History (JSON file database) =====
+interface PronunciationRecord {
+  id: string;
+  word: string;
+  timestamp: number;
+  date: string;           // human-readable
+  overall: number;
+  pitchStability: number;
+  vowelClarity: number;
+  voiceQuality: number;
+  fluency: number;
+  // Comparison scores (if available)
+  similarity?: number;
+  mfccScore?: number;
+  pitchMatch?: number;
+  durationRatio?: number;
+  f1Similarity?: number;
+  f2Similarity?: number;
+  intensityMatch?: number;
+  // Meta
+  category?: string;
+  matched: boolean;       // did user speech match the target
+}
+
+const HISTORY_FILE = path.join(DATA_DIR, 'pronunciation_history.json');
+
+function loadHistory(): PronunciationRecord[] {
+  try {
+    if (fs.existsSync(HISTORY_FILE)) {
+      return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+    }
+  } catch (e) {
+    console.error('[DB] Failed to load history:', e);
+  }
+  return [];
+}
+
+function saveHistory(records: PronunciationRecord[]): void {
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(records, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[DB] Failed to save history:', e);
+  }
+}
+
+// Save a pronunciation attempt
+app.post('/api/pronunciation-history', (req, res) => {
+  const { word, scores, comparison, category, matched } = req.body;
+  if (!word || !scores) {
+    return res.status(400).json({ error: 'word and scores are required' });
+  }
+
+  const record: PronunciationRecord = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    word: word.toLowerCase(),
+    timestamp: Date.now(),
+    date: new Date().toISOString(),
+    overall: scores.overall ?? 0,
+    pitchStability: scores.pitchStability ?? 0,
+    vowelClarity: scores.vowelClarity ?? 0,
+    voiceQuality: scores.voiceQuality ?? 0,
+    fluency: scores.fluency ?? 0,
+    matched: matched ?? true,
+    category: category || 'general',
+  };
+
+  if (comparison) {
+    record.similarity = comparison.overallSimilarity;
+    record.mfccScore = comparison.mfccScore;
+    record.pitchMatch = comparison.pitchCorrelation;
+    record.durationRatio = comparison.durationRatio;
+    record.f1Similarity = comparison.f1Similarity;
+    record.f2Similarity = comparison.f2Similarity;
+    record.intensityMatch = comparison.intensityCorrelation;
+  }
+
+  const history = loadHistory();
+  history.push(record);
+  saveHistory(history);
+
+  console.log(`[DB] 💾 Saved: "${word}" — Overall: ${record.overall}, Similarity: ${record.similarity ?? 'N/A'}`);
+  res.json({ status: 'success', record });
+});
+
+// Get pronunciation history (optionally filter by word)
+app.get('/api/pronunciation-history', (req, res) => {
+  const history = loadHistory();
+  const word = (req.query.word as string)?.toLowerCase();
+
+  if (word) {
+    const filtered = history.filter(r => r.word === word);
+    res.json({ status: 'success', records: filtered, total: filtered.length });
+  } else {
+    res.json({ status: 'success', records: history, total: history.length });
+  }
+});
+
+// Get summary stats per word
+app.get('/api/pronunciation-summary', (req, res) => {
+  const history = loadHistory();
+  const summary: Record<string, {
+    word: string; attempts: number; avgScore: number;
+    bestScore: number; lastAttempt: string; trend: number[];
+  }> = {};
+
+  for (const r of history) {
+    if (!summary[r.word]) {
+      summary[r.word] = { word: r.word, attempts: 0, avgScore: 0, bestScore: 0, lastAttempt: '', trend: [] };
+    }
+    const s = summary[r.word];
+    s.attempts++;
+    s.avgScore = Math.round(((s.avgScore * (s.attempts - 1)) + r.overall) / s.attempts);
+    s.bestScore = Math.max(s.bestScore, r.overall);
+    s.lastAttempt = r.date;
+    s.trend.push(r.overall);
+  }
+
+  res.json({ status: 'success', summary: Object.values(summary) });
+});
+
 // ===== Serve comparison audio files =====
 // These are the aligned audio segments that Praat actually compared
 app.get('/api/audio/ref', (req, res) => {
@@ -181,7 +305,7 @@ app.post('/api/extract-target-word', async (req, res) => {
       return res.json({ status: 'success', word: null });
     }
 
-    // Strip MASTERED: tags from transcript — these are hidden system tags, not target words
+    // Strip MASTERED: tags from transcript
     const cleanTranscript = transcript.replace(/MASTERED:\s*\[?\w+\]?/gi, '').trim();
 
     const prompt = `You are analyzing an English vocabulary teaching session transcript.
@@ -192,16 +316,16 @@ Rules:
 - Do NOT return common teaching words like "vocabulary", "training", "repeat", "practice", "echo", "listen", "mastered", "master", "session", "analysis", "pronunciation".
 - The target word is typically the new/difficult word being taught.
 - If the teacher is just introducing themselves or chatting (not teaching a specific word yet), return "NONE".
-- IMPORTANT: If multiple words appear in the transcript, return ONLY the LAST/MOST RECENT one. The teacher moves from word to word — always return the newest word being practiced, NOT earlier ones.
+- IMPORTANT: If multiple words appear in the transcript, return ONLY the LAST/MOST RECENT one.
 - If the teacher is giving feedback about pronunciation (e.g. "great job", "try again"), the target word is the one they are giving feedback about.
-- NEVER return "mastered" — this is a system keyword, not a vocabulary word.
+- NEVER return "mastered".
 
 Transcript:
 "${cleanTranscript.substring(0, 500)}"
 
 Target word:`;
 
-    console.log(`[DeepSeek] 📤 Calling DeepSeek-V3 with ${transcript.length} chars of transcript`);
+    console.log(`[DeepSeek] 📤 Calling DeepSeek-V3 with ${transcript.length} chars...`);
 
     const response = await fetch('https://api-ai.gitcode.com/v1/chat/completions', {
       method: 'POST',
@@ -218,11 +342,29 @@ Target word:`;
       }),
     });
 
-    const data = await response.json() as any;
-    const rawWord = data?.choices?.[0]?.message?.content?.trim() || '';
-    const word = rawWord.toLowerCase().replace(/[^a-z-]/g, '');
+    const rawText = await response.text();
+    let rawWord = '';
 
-    console.log(`[DeepSeek] 📥 Raw: "${rawWord}" → Parsed: "${word}"`);
+    // 🔥 BULLETPROOF PARSER FOR GITCODE CORRUPTED JSON 🔥
+    // GitCode API randomly injects invisible carriage returns (\r), spaces, and corrupts the JSON structure.
+    // Instead of using JSON.parse (which will throw randomly), we search for the "content":"<word>" pattern directly!
+    // We look for any content block that has an actual word
+
+    // First, let's clean any literal carriage returns and strange whitespace
+    const cleanedText = rawText.replace(/\r/g, '').replace(/[\x00-\x1F\x7F-\x9F]/g, '');
+
+    // Now extract all text inside "content": "..."
+    const matches = [...cleanedText.matchAll(/"content"\s*:\s*"([^"]+)"/g)];
+
+    if (matches.length > 0) {
+      // Concatenate all valid content chunks (sometimes it streams despite stream:false)
+      rawWord = matches.map(m => m[1]).join('');
+    } else {
+      console.error(`[DeepSeek] Regex parser failed to find content. Raw snippet: ${rawText.substring(0, 100)}...`);
+    }
+
+    const word = rawWord.toLowerCase().replace(/[^a-z-]/g, '');
+    console.log(`[DeepSeek] 📥 Raw extracted: "${rawWord}" → Parsed: "${word}"`);
 
     // Filter out known non-target words
     const blacklist = ['none', 'mastered', 'master', 'repeat', 'practice', 'echo', 'listen', 'vocabulary', 'training', 'session', 'analysis', 'pronunciation'];
