@@ -9,8 +9,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-// Resolve Praat executable path relative to project root
-const PRAAT_EXE = path.join(process.cwd(), 'praat', 'Praat.exe');
+// Resolve Praat executable path — cross-platform (Windows local dev + Linux HuggingFace)
+const IS_LINUX = os.platform() === 'linux';
+const PRAAT_EXE = IS_LINUX
+  ? '/usr/bin/praat'
+  : path.join(process.cwd(), 'praat', 'Praat.exe');
 const PRAAT_SCRIPT = path.join(process.cwd(), 'praat', 'analyze.praat');
 const PRAAT_COMPARE_SCRIPT = path.join(process.cwd(), 'praat', 'compare.praat');
 const QUERY_VOWELS_SCRIPT = path.join(process.cwd(), 'praat', 'query_vowels.praat');
@@ -19,9 +22,9 @@ const MFCC_DTW_SCRIPT = path.join(process.cwd(), 'praat', 'mfcc_dtw.py');
 const PHONEME_SCRIPT = path.join(process.cwd(), 'praat', 'phoneme_analysis.py');
 const FORCED_ALIGN_SCRIPT = path.join(process.cwd(), 'scripts', 'forced_align.py');
 
-// Use .venv Python if available (has numpy, torch, etc.), fallback to system python
+// Use .venv Python if available (Windows), else system python3 (Linux)
 const VENV_PYTHON = path.join(process.cwd(), '.venv', 'Scripts', 'python.exe');
-const PYTHON_EXE = fs.existsSync(VENV_PYTHON) ? VENV_PYTHON : 'python';
+const PYTHON_EXE = fs.existsSync(VENV_PYTHON) ? VENV_PYTHON : (IS_LINUX ? 'python3' : 'python');
 
 // Toggle server-side debug logging: set ECHOMIND_DEBUG=1 in environment
 const DEBUG = !!process.env.ECHOMIND_DEBUG;
@@ -1101,34 +1104,50 @@ function locateWordInCharSegments(charSegments: any[], targetWord: string): { st
  * hint_start/hint_end: optional timing from wav2vec2 to narrow the search window.
  */
 async function runForcedAlignment(wavPath: string, word: string, phonemes: string[], hintStart?: number, hintEnd?: number): Promise<ForcedAlignResult | null> {
-  try {
-    const serverOk = await ensureAlignServer();
-    if (!serverOk) {
-      console.error(`[PraatService] Alignment server not available`);
+  const maxRetries = 2;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const serverOk = await ensureAlignServer();
+      if (!serverOk) {
+        console.error(`[PraatService] Alignment server not available (attempt ${attempt}/${maxRetries})`);
+        if (attempt < maxRetries) {
+          // Reset state and retry
+          alignServerReady = false;
+          alignServerStarting = null;
+          continue;
+        }
+        return null;
+      }
+
+      const payload: any = { wav_path: wavPath, word, phonemes };
+      if (hintStart !== undefined && hintEnd !== undefined) {
+        payload.hint_start = hintStart;
+        payload.hint_end = hintEnd;
+      }
+      const result = await httpPost(`${ALIGN_SERVER_URL}/align`, payload);
+
+      if (result.error) {
+        console.error(`[PraatService] Alignment error:`, result.error);
+        return null;
+      }
+
+      console.log(`[PraatService] 🎯 Aligned ${word}: ${result.vowels.length} vowels`);
+      for (const v of result.vowels) {
+        console.log(`[PraatService]   ${v.phoneme}: ${v.start.toFixed(3)}-${v.end.toFixed(3)}s`);
+      }
+      return result;
+    } catch (e: any) {
+      console.error(`[PraatService] Forced alignment failed (attempt ${attempt}/${maxRetries}):`, e.message);
+      if (attempt < maxRetries && (e.message.includes('socket hang up') || e.message.includes('ECONNREFUSED') || e.message.includes('timeout'))) {
+        console.log(`[PraatService] 🔄 Resetting align server and retrying...`);
+        alignServerReady = false;
+        alignServerStarting = null;
+        continue;
+      }
       return null;
     }
-
-    const payload: any = { wav_path: wavPath, word, phonemes };
-    if (hintStart !== undefined && hintEnd !== undefined) {
-      payload.hint_start = hintStart;
-      payload.hint_end = hintEnd;
-    }
-    const result = await httpPost(`${ALIGN_SERVER_URL}/align`, payload);
-
-    if (result.error) {
-      console.error(`[PraatService] Alignment error:`, result.error);
-      return null;
-    }
-
-    console.log(`[PraatService] 🎯 Aligned ${word}: ${result.vowels.length} vowels`);
-    for (const v of result.vowels) {
-      console.log(`[PraatService]   ${v.phoneme}: ${v.start.toFixed(3)}-${v.end.toFixed(3)}s`);
-    }
-    return result;
-  } catch (e: any) {
-    console.error(`[PraatService] Forced alignment failed:`, e.message);
-    return null;
   }
+  return null;
 }
 
 /**

@@ -1,0 +1,26 @@
+# Core scientific computing
+numpy>=2.0
+scipy>=1.14
+
+# Audio processing
+librosa>=0.11
+soundfile>=0.13
+soxr>=1.0
+
+# PyTorch (CPU only for deployment)
+torch>=2.6
+torchaudio>=2.6
+
+# Whisper for speech recognition
+faster-whisper>=1.2
+ctranslate2>=4.7
+
+# Transformers for wav2vec2
+transformers>=5.0
+tokenizers>=0.22
+
+# ML utilities
+scikit-learn>=1.5
+
+# HTTP requests
+requests>=2.32

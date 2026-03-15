@@ -4,10 +4,17 @@ import bodyParser from 'body-parser';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
+import dotenv from 'dotenv';
+
+// Load environment variables from .env.local
+dotenv.config({ path: '.env.local' });
+// Also try .env just in case
+dotenv.config();
+
 import { analyzePronunciation, comparePronunciation } from './praatService.js';
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
@@ -130,29 +137,76 @@ interface PronunciationRecord {
   matched: boolean;       // did user speech match the target
 }
 
+import { initializeApp } from "firebase/app";
+import { getDatabase, ref, push, set, get, child } from "firebase/database";
+
+const firebaseConfig = {
+  apiKey: process.env.FIREBASE_API_KEY,
+  authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+  databaseURL: process.env.FIREBASE_DATABASE_URL,
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+  appId: process.env.FIREBASE_APP_ID
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getDatabase(firebaseApp);
+
 const HISTORY_FILE = path.join(DATA_DIR, 'pronunciation_history.json');
 
-function loadHistory(): PronunciationRecord[] {
+// Local fallback memory for when Firebase is down or starting up
+let fallback_history: PronunciationRecord[] = [];
+
+async function loadHistory(): Promise<PronunciationRecord[]> {
+  if (process.env.FIREBASE_DATABASE_URL) {
+    try {
+      const dbRef = ref(db);
+      const snapshot = await get(child(dbRef, `pronunciation_history`));
+      if (snapshot.exists()) {
+        const data = snapshot.val();
+        // Convert object to array
+        return Object.values(data);
+      }
+      return [];
+    } catch (e) {
+      console.error('[DB] Firebase error, falling back locally:', e);
+    }
+  }
+
+  // Fallback to local
   try {
     if (fs.existsSync(HISTORY_FILE)) {
-      return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+      const hist = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf-8'));
+      fallback_history = hist;
+      return hist;
     }
-  } catch (e) {
-    console.error('[DB] Failed to load history:', e);
-  }
-  return [];
+  } catch {}
+  return fallback_history;
 }
 
-function saveHistory(records: PronunciationRecord[]): void {
-  try {
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(records, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('[DB] Failed to save history:', e);
+async function saveHistory(record: PronunciationRecord): Promise<void> {
+  if (process.env.FIREBASE_DATABASE_URL) {
+    try {
+      const histRef = ref(db, 'pronunciation_history');
+      const newRecordRef = push(histRef);
+      await set(newRecordRef, record);
+      return;
+    } catch (e) {
+      console.error('[DB] Failed to save to Firebase:', e);
+    }
   }
+
+  // Fallback
+  fallback_history = await loadHistory();
+  fallback_history.push(record);
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(fallback_history, null, 2), 'utf-8');
+  } catch {}
 }
 
 // Save a pronunciation attempt
-app.post('/api/pronunciation-history', (req, res) => {
+app.post('/api/pronunciation-history', async (req, res) => {
   const { word, scores, comparison, category, matched } = req.body;
   if (!word || !scores) {
     return res.status(400).json({ error: 'word and scores are required' });
@@ -182,17 +236,15 @@ app.post('/api/pronunciation-history', (req, res) => {
     record.intensityMatch = comparison.intensityCorrelation;
   }
 
-  const history = loadHistory();
-  history.push(record);
-  saveHistory(history);
+  await saveHistory(record);
 
-  console.log(`[DB] 💾 Saved: "${word}" — Overall: ${record.overall}, Similarity: ${record.similarity ?? 'N/A'}`);
+  console.log(`[DB] 💾 Saved to Cloud: "${word}" — Overall: ${record.overall}, Similarity: ${record.similarity ?? 'N/A'}`);
   res.json({ status: 'success', record });
 });
 
 // Get pronunciation history (optionally filter by word)
-app.get('/api/pronunciation-history', (req, res) => {
-  const history = loadHistory();
+app.get('/api/pronunciation-history', async (req, res) => {
+  const history = await loadHistory();
   const word = (req.query.word as string)?.toLowerCase();
 
   if (word) {
@@ -204,8 +256,8 @@ app.get('/api/pronunciation-history', (req, res) => {
 });
 
 // Get summary stats per word
-app.get('/api/pronunciation-summary', (req, res) => {
-  const history = loadHistory();
+app.get('/api/pronunciation-summary', async (req, res) => {
+  const history = await loadHistory();
   const summary: Record<string, {
     word: string; attempts: number; avgScore: number;
     bestScore: number; lastAttempt: string; trend: number[];
@@ -224,6 +276,53 @@ app.get('/api/pronunciation-summary', (req, res) => {
   }
 
   res.json({ status: 'success', summary: Object.values(summary) });
+});
+
+// ===== Acoustic Representation (聲音表徵) =====
+import { execFile } from 'child_process';
+
+const ACOUSTIC_REPR_SCRIPT = path.join(process.cwd(), 'praat', 'acoustic_repr.py');
+
+app.get('/api/acoustic-representation', (req, res) => {
+  const word = req.query.word as string | undefined;
+  const args = ['python', ACOUSTIC_REPR_SCRIPT, HISTORY_FILE];
+  if (word) args.push('--word', word.toLowerCase());
+
+  execFile(args[0], args.slice(1), { timeout: 15000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    if (error) {
+      console.error('[AcousticRepr] Error:', error.message);
+      return res.status(500).json({ error: 'Acoustic representation failed', details: error.message });
+    }
+    try {
+      const result = JSON.parse(stdout.toString().trim());
+      console.log(`[AcousticRepr] ✅ Generated for ${word || 'all words'}`);
+      res.json({ status: 'success', ...result });
+    } catch (e) {
+      console.error('[AcousticRepr] Parse error:', stdout.toString().substring(0, 200));
+      res.status(500).json({ error: 'Failed to parse acoustic representation' });
+    }
+  });
+});
+
+// Download acoustic representation as JSON file
+app.get('/api/acoustic-representation/download', (req, res) => {
+  const args = ['python', ACOUSTIC_REPR_SCRIPT, HISTORY_FILE];
+
+  execFile(args[0], args.slice(1), { timeout: 15000, maxBuffer: 2 * 1024 * 1024 }, (error, stdout) => {
+    if (error) {
+      return res.status(500).json({ error: 'Generation failed' });
+    }
+    try {
+      const result = JSON.parse(stdout.toString().trim());
+      const filename = `acoustic_representation_${new Date().toISOString().slice(0, 10)}.json`;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.send(JSON.stringify(result, null, 2));
+      console.log(`[AcousticRepr] 📥 Download: ${filename}`);
+    } catch (e) {
+      res.status(500).json({ error: 'Parse failed' });
+    }
+  });
 });
 
 // ===== Serve comparison audio files =====

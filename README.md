@@ -1,20 +1,46 @@
+---
+title: EchoMind - AI Pronunciation Coach
+emoji: 🎤
+colorFrom: purple
+colorTo: blue
+sdk: docker
+pinned: false
+app_port: 7860
+---
+
 <div align="center">
 <img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Run and deploy your AI Studio app
+# EchoMind — AI-Powered Pronunciation Coach
 
-This contains everything you need to run your app locally.
+An intelligent pronunciation learning system powered by **Google Gemini Live API** that provides real-time, scientifically-grounded feedback on English pronunciation.
 
-View your app in AI Studio: https://ai.studio/apps/d6d9bf8b-2650-4b38-9d46-ad4639ff0c71
+## Features
+
+- 🎙️ **Real-time Conversation** with AI tutor via Gemini Live API
+- 📊 **F1/F2 Formant Analysis** using Praat for precise vowel measurement
+- 🧠 **MMS Forced Alignment** for per-syllable phoneme-level feedback  
+- 🔊 **MFCC-DTW Comparison** between user and reference pronunciation
+- 🔤 **wav2vec2 Phoneme Recognition** for pronunciation accuracy scoring
+- ☁️ **Firebase Realtime Database** for cloud-based progress tracking
+
+## Tech Stack
+
+- **AI**: Google Gemini 2.0 Flash (Live API) via `@google/genai` SDK
+- **Frontend**: React + TypeScript + Vite
+- **Backend**: Node.js (Express) + Python (PyTorch)
+- **Analysis**: Praat, librosa, torchaudio
+- **Cloud**: Firebase Realtime Database (Google Cloud)
 
 ## Run Locally
 
-**Prerequisites:**  Node.js
-
+**Prerequisites:** Node.js 20+, Python 3.12+
 
 1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+   ```bash
+   npm install
+   pip install -r requirements.txt
+   ```
+2. Set `GEMINI_API_KEY` in `.env.local`
+3. Run: `npm run dev`
