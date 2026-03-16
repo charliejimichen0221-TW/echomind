@@ -21,4 +21,4 @@ done
 
 # Start the Node.js server (production mode) using tsx
 echo "🌐 Starting Node.js server (port 7860)..."
-NODE_ENV=production ECHOMIND_DEBUG=1 npx tsx server.ts
+PORT=7860 NODE_ENV=production ECHOMIND_DEBUG=1 npx tsx server.ts
