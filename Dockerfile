@@ -6,6 +6,9 @@ COPY package.json package-lock.json* ./
 RUN npm ci --ignore-scripts
 
 COPY . .
+# Let Hugging Face inject secrets during build (if available) or pass as ARG
+ARG GEMINI_API_KEY
+ENV GEMINI_API_KEY=$GEMINI_API_KEY
 RUN npm run build
 
 # ─── Stage 2: Production runtime ───────────────────────────────────
