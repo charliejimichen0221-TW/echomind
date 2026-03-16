@@ -19,6 +19,6 @@ for i in $(seq 1 120); do
   sleep 1
 done
 
-# Start the Node.js server (production mode)
+# Start the Node.js server (production mode) using tsx
 echo "🌐 Starting Node.js server (port 7860)..."
-NODE_ENV=production ECHOMIND_DEBUG=1 node server_prod.js
+NODE_ENV=production ECHOMIND_DEBUG=1 npx tsx server.ts
