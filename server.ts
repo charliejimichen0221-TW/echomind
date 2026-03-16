@@ -349,6 +349,14 @@ app.get('/api/audio/user', (req, res) => {
   }
 });
 
+// Endpoints ---------------------------------------------------------------------------------------------------------
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    GEMINI_API_KEY: process.env.GEMINI_API_KEY || ''
+  });
+});
+
 // ===== Praat Pronunciation Analysis =====
 app.post('/api/analyze-pronunciation', async (req, res) => {
   try {

@@ -643,7 +643,26 @@ export function useLiveAPI() {
     try {
       dbg('flow', '🚀 CONNECT: Initializing session...');
       dbgUpdateState({ sessionActive: true, turnCount: 0, analysisCount: 0, errorCount: 0 });
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+      // Fetch GEMINI API KEY from our secure backend first if not found
+      let apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
+      if (!apiKey) {
+        try {
+          const cfgRes = await fetch('/api/config');
+          if (cfgRes.ok) {
+            const cfg = await cfgRes.json();
+            apiKey = cfg.GEMINI_API_KEY;
+          }
+        } catch(e) {
+          console.error("Failed to fetch API key from backend", e);
+        }
+      }
+
+      if (!apiKey) {
+        throw new Error('API key must be set when using the Gemini API. Please check your backend configuration.');
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
       processorRef.current = new AudioProcessor();
       playerRef.current = new AudioPlayer((v) => setVolume(v));
       processorRef.current.setBuffering(false); // start with buffering OFF (AI will speak first)
