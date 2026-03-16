@@ -4,6 +4,7 @@ import { Mic, MicOff, Send, MessageSquare, Shield, Zap, Info, History, X, User, 
 import { useLiveAPI } from './hooks/useLiveAPI';
 import { AudioVisualizer } from './components/AudioVisualizer';
 import { TalkingHead } from './components/TalkingHead';
+import { AcousticAura } from './components/AcousticAura';
 import { cn } from './utils/cn';
 import { generateDebaterImage } from './services/imageService';
 import { setupDebugHelpers } from './utils/debugLogger';
@@ -16,7 +17,7 @@ const TRAINING_LEVELS = [
 ];
 
 export default function App() {
-  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord, recognizedSpeech, speechMismatch, pauseAI, resumeAI } = useLiveAPI();
+  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord, recognizedSpeech, speechMismatch, acousticRepresentation, recordingSecondsLeft, pauseAI, resumeAI } = useLiveAPI();
   const [selectedLevel, setSelectedLevel] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [debaterImage, setDebaterImage] = useState<string | null>(null);
@@ -208,14 +209,22 @@ export default function App() {
     - The objective analysis data will arrive shortly as [PRONUNCIATION_ANALYSIS_RESULT]. Wait for it.
     
     WHEN YOU RECEIVE "[PRONUNCIATION_ANALYSIS_RESULT]":
-    - This is REAL data from Praat acoustic analysis software. ONLY THEN may you discuss pronunciation.
+    - This is REAL data from Praat acoustic analysis + wav2vec2 speech recognition. ONLY THEN may you discuss pronunciation.
     - Base ALL feedback on the numbers provided:
       * Overall score > 70: "That was really good!"
       * Overall score 40-70: "Not bad, but let's work on some areas."
       * Overall score < 40: "Let's try that again."
       * Cite specific scores (pitch %, vowel %, pace) in your feedback.
+    - If "wav2vec2 Speech Recognition" data is included, use it:
+      * Tell the user what the system heard vs what was expected (e.g., "The system heard 'PATOSY' instead of 'HYPOTHESIS'")
+      * Mention specific sound issues if listed (e.g., "'O' became 'A'", or "'TH' missing")
+    - If "Pronunciation tips to share" are listed, you MUST share at least one tip naturally:
+      * Tongue position tips (e.g., "Try pushing your tongue forward")
+      * Mouth opening tips (e.g., "Open your mouth wider for the 'ah' sound")
+      * Speed tips (e.g., "Try connecting the syllables more smoothly")
+      * Break the word into syllables to help them practice
     - Be encouraging. Mention what they did WELL first, then what to improve.
-    - Keep feedback to 2-3 sentences.
+    - Keep feedback to 3-4 sentences max.
     - If similarity < 60%, ask them to try again. If >= 60%, move on.
     
     IF YOU DO NOT RECEIVE "[PRONUNCIATION_ANALYSIS_RESULT]":
@@ -492,8 +501,54 @@ export default function App() {
                 <div className="mt-4 flex items-center justify-center gap-3 text-[10px] uppercase tracking-[0.2em] font-bold text-zinc-500">
                   <Mic className="w-3 h-3" />
                   Live Audio Stream Active
-                </div>
               </div>
+              </div>
+
+              {/* ===== Recording Countdown Timer ===== */}
+              <AnimatePresence>
+                {recordingSecondsLeft !== null && recordingSecondsLeft > 0 && !isAnalyzing && !isSpeaking && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.8, y: -10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.8, y: -10 }}
+                    className="flex items-center justify-center gap-4 py-3"
+                  >
+                    {/* Circular countdown */}
+                    <div className="relative w-14 h-14">
+                      <svg className="w-14 h-14 -rotate-90" viewBox="0 0 56 56">
+                        <circle cx="28" cy="28" r="24" fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="3" />
+                        <circle
+                          cx="28" cy="28" r="24" fill="none"
+                          stroke={recordingSecondsLeft <= 3 ? '#ef4444' : recordingSecondsLeft <= 5 ? '#f59e0b' : '#10b981'}
+                          strokeWidth="3"
+                          strokeLinecap="round"
+                          strokeDasharray={`${2 * Math.PI * 24}`}
+                          strokeDashoffset={`${2 * Math.PI * 24 * (1 - recordingSecondsLeft / 10)}`}
+                          style={{ transition: 'stroke-dashoffset 0.3s ease, stroke 0.3s ease' }}
+                        />
+                      </svg>
+                      <div className={`absolute inset-0 flex items-center justify-center text-lg font-bold ${
+                        recordingSecondsLeft <= 3 ? 'text-red-400 animate-pulse' : recordingSecondsLeft <= 5 ? 'text-amber-400' : 'text-emerald-400'
+                      }`}>
+                        {recordingSecondsLeft}
+                      </div>
+                    </div>
+                    <div className="flex flex-col">
+                      <div className="flex items-center gap-1.5">
+                        <Mic className={`w-3.5 h-3.5 ${recordingSecondsLeft <= 3 ? 'text-red-400 animate-pulse' : 'text-emerald-400'}`} />
+                        <span className={`text-xs font-bold uppercase tracking-wider ${
+                          recordingSecondsLeft <= 3 ? 'text-red-400' : recordingSecondsLeft <= 5 ? 'text-amber-400' : 'text-emerald-400'
+                        }`}>
+                          {recordingSecondsLeft <= 3 ? 'Hurry up!' : 'Your Turn'}
+                        </span>
+                      </div>
+                      <span className="text-[10px] text-zinc-500 mt-0.5">
+                        Say "{currentTargetWord}" now
+                      </span>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
               {/* ===== Praat Pronunciation Score Panel ===== */}
               <AnimatePresence>
@@ -587,9 +642,7 @@ export default function App() {
                           {/* Score Bars */}
                           <div className="space-y-3 mb-5">
                             {[
-                              { label: 'Pitch Stability', value: pronunciationScore.pitchStability, icon: AudioLines, color: 'blue' },
                               { label: 'Vowel Clarity', value: pronunciationScore.vowelClarity, icon: Volume2, color: 'violet' },
-                              { label: 'Voice Quality', value: pronunciationScore.voiceQuality, icon: Mic, color: 'emerald' },
                               { label: 'Fluency', value: pronunciationScore.fluency, icon: BarChart3, color: 'amber' },
                             ].map(({ label, value, icon: Icon, color }) => (
                               <div key={label} className="flex items-center gap-3">
@@ -806,6 +859,119 @@ export default function App() {
                                 ))}
                               </div>
 
+                              {/* ── Per-Syllable Vowel Detail ── */}
+                              {pronunciationScore.comparison.vowelAnalysis && pronunciationScore.comparison.vowelAnalysis.length > 0 && (
+                                <motion.div
+                                  initial={{ opacity: 0, y: 10 }}
+                                  animate={{ opacity: 1, y: 0 }}
+                                  transition={{ delay: 0.3 }}
+                                  className="mb-5 p-4 rounded-xl bg-zinc-800/50 border border-white/5"
+                                >
+                                  <div className="flex items-center justify-between mb-4">
+                                    <p className="text-[9px] uppercase tracking-[0.2em] font-bold text-violet-400">Vowel Detail</p>
+                                    <span className="text-[9px] text-zinc-500">{pronunciationScore.comparison.vowelAnalysis.length} vowels analyzed</span>
+                                  </div>
+
+                                  {/* Syllable Timeline */}
+                                  <div className="flex items-center justify-center gap-1 mb-5">
+                                    {pronunciationScore.comparison.vowelAnalysis.map((v: any, i: number) => (
+                                      <div key={i} className="flex items-center">
+                                        {i > 0 && <div className="w-4 h-px bg-zinc-700 mx-0.5" />}
+                                        <div className="flex flex-col items-center gap-1">
+                                          <div
+                                            className={cn(
+                                              "w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border-2 transition-all",
+                                              v.overallMatch >= 75
+                                                ? "bg-emerald-500/20 border-emerald-500/50 text-emerald-400"
+                                                : v.overallMatch >= 50
+                                                ? "bg-amber-500/20 border-amber-500/50 text-amber-400"
+                                                : "bg-red-500/20 border-red-500/50 text-red-400"
+                                            )}
+                                          >
+                                            {v.isStressed ? '★' : i + 1}
+                                          </div>
+                                          <span className="text-[7px] text-zinc-600">{i + 1}</span>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+
+                                  {/* Per-Syllable Analysis */}
+                                  <div className="space-y-3">
+                                    {pronunciationScore.comparison.vowelAnalysis.map((v: any, i: number) => (
+                                      <motion.div
+                                        key={i}
+                                        initial={{ opacity: 0, x: -10 }}
+                                        animate={{ opacity: 1, x: 0 }}
+                                        transition={{ delay: 0.1 * i }}
+                                        className={cn(
+                                          "p-3 rounded-lg border transition-all",
+                                          v.isStressed
+                                            ? "bg-amber-500/5 border-amber-500/20"
+                                            : "bg-zinc-900/50 border-white/5"
+                                        )}
+                                      >
+                                        <div className="flex items-center gap-2 mb-2">
+                                          <span className="text-[10px] font-bold text-zinc-300">
+                                            Syllable {i + 1} {v.isStressed && <span className="text-amber-400">★</span>}
+                                          </span>
+                                          <span className={cn(
+                                            "text-[9px] px-1.5 py-0.5 rounded-full font-medium",
+                                            v.overallMatch >= 75 ? "bg-emerald-500/10 text-emerald-400" :
+                                            v.overallMatch >= 50 ? "bg-amber-500/10 text-amber-400" :
+                                            "bg-red-500/10 text-red-400"
+                                          )}>
+                                            {v.overallMatch}%
+                                          </span>
+                                        </div>
+
+                                        {/* Mouth (F1) */}
+                                        <div className="flex items-center gap-2 mb-1.5">
+                                          <span className="text-[8px] text-zinc-500 font-medium w-12 shrink-0 uppercase tracking-wider">Mouth</span>
+                                          <div className="flex-1 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                                            <motion.div
+                                              initial={{ width: 0 }}
+                                              animate={{ width: `${v.f1Similarity}%` }}
+                                              transition={{ duration: 0.6, ease: 'easeOut', delay: 0.1 * i }}
+                                              className={cn(
+                                                "h-full rounded-full",
+                                                v.f1Similarity >= 70 ? 'bg-emerald-500' : v.f1Similarity >= 50 ? 'bg-amber-500' : 'bg-red-500'
+                                              )}
+                                            />
+                                          </div>
+                                          <span className="text-[9px] font-mono text-zinc-500 w-8 text-right">{v.f1Similarity}%</span>
+                                        </div>
+
+                                        {/* Tongue (F2) */}
+                                        <div className="flex items-center gap-2 mb-2">
+                                          <span className="text-[8px] text-zinc-500 font-medium w-12 shrink-0 uppercase tracking-wider">Tongue</span>
+                                          <div className="flex-1 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                                            <motion.div
+                                              initial={{ width: 0 }}
+                                              animate={{ width: `${v.f2Similarity}%` }}
+                                              transition={{ duration: 0.6, ease: 'easeOut', delay: 0.1 * i + 0.05 }}
+                                              className={cn(
+                                                "h-full rounded-full",
+                                                v.f2Similarity >= 70 ? 'bg-emerald-500' : v.f2Similarity >= 50 ? 'bg-amber-500' : 'bg-red-500'
+                                              )}
+                                            />
+                                          </div>
+                                          <span className="text-[9px] font-mono text-zinc-500 w-8 text-right">{v.f2Similarity}%</span>
+                                        </div>
+
+                                        {/* Tip */}
+                                        <p className={cn(
+                                          "text-[10px] leading-relaxed",
+                                          v.overallMatch >= 75 ? "text-emerald-400/80" : "text-zinc-400"
+                                        )}>
+                                          → {v.tip}
+                                        </p>
+                                      </motion.div>
+                                    ))}
+                                  </div>
+                                </motion.div>
+                              )}
+
                               {/* Comparison Feedback */}
                               {pronunciationScore.comparison.feedback.length > 0 && (
                                 <div className="space-y-2">
@@ -830,6 +996,12 @@ export default function App() {
                   </motion.div>
                 )}
               </AnimatePresence>
+
+              {/* ===== Acoustic Aura: Sound Profile Visualization ===== */}
+              <AcousticAura
+                wordData={acousticRepresentation}
+                isVisible={!!acousticRepresentation && isConnected}
+              />
             </div>
 
             {/* Right Column: Transcript */}
@@ -912,8 +1084,17 @@ export default function App() {
           <span>Status: {isConnected ? 'Training' : 'Standby'}</span>
           <span>Mode: Pure Auditory Memory</span>
         </div>
-        <div>
-          © 2026 EchoMind Labs
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => {
+              window.open('/api/acoustic-representation/download', '_blank');
+            }}
+            className="px-3 py-1 rounded-md bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-all text-[10px] uppercase tracking-wider border border-zinc-700/50 hover:border-zinc-500/50 cursor-pointer"
+            title="Download your pronunciation acoustic representation as JSON"
+          >
+            ↓ Sound Profile
+          </button>
+          <span>© 2026 EchoMind Labs</span>
         </div>
       </footer>
 

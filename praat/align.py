@@ -179,11 +179,61 @@ def find_word_in_audio(wav_path: str, target_word: str, use_hint: bool = False) 
         best_match = None
     
     if best_match:
-        # Dynamic padding based on word duration — adapts to short and long words
+        # ── Energy-based onset detection ──
+        # Whisper's timestamps can miss 200-650ms at the start of words
+        # (especially /h/, /s/, /f/ onsets). Scan backwards from Whisper's
+        # start to find where energy actually begins rising.
         word_dur = best_match.end - best_match.start
-        before_pad = min(0.6, max(0.15, word_dur * 0.15))  # 15% of word, 150ms–600ms
-        after_pad  = min(0.6, max(0.30, word_dur * 0.25))  # 25% of word, 300ms–600ms
-        start = max(0, best_match.start - before_pad)
+        
+        # Search up to 1.0s before Whisper's start for energy onset
+        search_start = max(0, best_match.start - 1.0)
+        onset_time = best_match.start  # default: Whisper's time
+        
+        try:
+            import wave, struct
+            with wave.open(wav_path, 'rb') as wf:
+                rate = wf.getframerate()
+                n_frames = wf.getnframes()
+                wf.readframes(0)
+                
+                # Get peak energy near Whisper's detected region for threshold
+                peak_start = max(0, int(best_match.start * rate))
+                peak_end = min(n_frames, int(best_match.end * rate))
+                wf.setpos(peak_start)
+                peak_frames = wf.readframes(peak_end - peak_start)
+                if len(peak_frames) >= 2:
+                    peak_samples = struct.unpack(f'<{len(peak_frames)//2}h', peak_frames)
+                    peak_rms = (sum(s*s for s in peak_samples) / len(peak_samples)) ** 0.5
+                    energy_threshold = peak_rms * 0.10  # 10% of speech energy = onset
+                    
+                    # Scan backwards in 25ms windows from Whisper's start
+                    window_size = int(rate * 0.025)  # 25ms
+                    scan_from = int(search_start * rate)
+                    scan_to = int(best_match.start * rate)
+                    
+                    # Find first window above threshold (scanning forward from search_start)
+                    first_energy_pos = scan_to  # default
+                    for pos in range(scan_from, scan_to, window_size):
+                        end_pos = min(pos + window_size, n_frames)
+                        wf.setpos(pos)
+                        chunk_frames = wf.readframes(end_pos - pos)
+                        if len(chunk_frames) >= 2:
+                            chunk_samples = struct.unpack(f'<{len(chunk_frames)//2}h', chunk_frames)
+                            chunk_rms = (sum(s*s for s in chunk_samples) / len(chunk_samples)) ** 0.5
+                            if chunk_rms > energy_threshold:
+                                first_energy_pos = pos
+                                break
+                    
+                    onset_time = max(0, first_energy_pos / rate - 0.05)  # 50ms extra safety margin
+        except Exception:
+            pass  # Fall back to padding approach
+        
+        # Use the earlier of: energy onset or padded Whisper start
+        before_pad = min(0.6, max(0.35, word_dur * 0.30))
+        padded_start = max(0, best_match.start - before_pad)
+        start = min(padded_start, onset_time)  # take whichever is earlier
+        
+        after_pad = min(0.6, max(0.30, word_dur * 0.25))
         end = best_match.end + after_pad
         
         return {

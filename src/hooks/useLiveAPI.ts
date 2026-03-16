@@ -34,6 +34,20 @@ export interface ComparisonResult {
   ref: { meanPitch: number; f1: number; f2: number; duration: number; meanIntensity: number };
   user: { meanPitch: number; f1: number; f2: number; duration: number; meanIntensity: number };
   pitchContour: { ref: number[]; user: number[] };
+  vowelAnalysis?: {
+    syllableIndex: number;
+    syllable: string;
+    isStressed: boolean;
+    vowel: string;
+    refF1: number; refF2: number;
+    userF1: number; userF2: number;
+    f1Similarity: number;
+    f2Similarity: number;
+    overallMatch: number;
+    f1Direction: string;
+    f2Direction: string;
+    tip: string;
+  }[];
   feedback: string[];
   audioTimestamp?: number;
 }
@@ -162,6 +176,11 @@ export function useLiveAPI() {
   const [currentTargetWord, setCurrentTargetWord] = useState<string | null>(null);
   const [recognizedSpeech, setRecognizedSpeech] = useState<string | null>(null);
   const [speechMismatch, setSpeechMismatch] = useState(false);
+  const [acousticRepresentation, setAcousticRepresentation] = useState<any>(null);
+  const [recordingSecondsLeft, setRecordingSecondsLeft] = useState<number | null>(null);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordingDeadlineRef = useRef<number>(0);
+  const RECORDING_TIME_LIMIT = 10; // seconds
 
   // ── Refs ──
   const sessionRef = useRef<any>(null);
@@ -324,8 +343,8 @@ export function useLiveAPI() {
     // without speaking for a long time. The actual sentence was spoken at the END.
     // Global proportional mapping (idx/total * totalChunks) fails completely if there's long silence.
     // Solution: We extract a generous window (up to 30s) from the END of the active audio.
-    const MAX_USER_CHUNKS = 100;    // ~25.6s at 4096/16000
-    const ACTIVE_SENTENCE_CHUNKS = Math.min(userChunks.length, 120); // ~30s max of recent activity
+    const MAX_USER_CHUNKS = 40;    // ~10.2s at 4096/16000 (matches 10s recording limit)
+    const ACTIVE_SENTENCE_CHUNKS = Math.min(userChunks.length, 50); // ~12.8s max of recent activity
 
     if (userChunks.length > MAX_USER_CHUNKS) {
       const totalChunks = userChunks.length;
@@ -440,26 +459,152 @@ export function useLiveAPI() {
           ``,
           `Praat acoustic analysis:`,
           `  Overall: ${score.overall}/100`,
-          `  Pitch stability: ${score.pitchStability}/100`,
           `  Vowel clarity: ${score.vowelClarity}/100`,
-          `  Voice quality: ${score.voiceQuality}/100`,
           `  Fluency: ${score.fluency}/100`,
         ];
         if (comp) {
           lines.push(
             `  Similarity: ${comp.overallSimilarity}%`,
             `  Pitch match: ${(comp.pitchCorrelation * 100).toFixed(1)}%`,
-            `  Vowel F1: ${comp.f1Similarity.toFixed(1)}%`,
-            `  Vowel F2: ${comp.f2Similarity.toFixed(1)}%`,
             `  Pace ratio: ${comp.durationRatio.toFixed(2)}x`,
           );
+
+          // Include per-syllable vowel analysis if available
+          if (comp.vowelAnalysis && comp.vowelAnalysis.length > 0) {
+            lines.push(``, `Per-syllable vowel analysis:`);
+            comp.vowelAnalysis.forEach(v => {
+              const stress = v.isStressed ? ' ★STRESSED' : '';
+              lines.push(
+                `  Syl ${v.syllableIndex + 1}${stress}: Mouth=${v.f1Similarity}% Tongue=${v.f2Similarity}% (${v.overallMatch}%)`,
+                `    ${v.tip}`,
+              );
+            });
+          } else {
+            lines.push(
+              `  Vowel F1: ${comp.f1Similarity.toFixed(1)}%`,
+              `  Vowel F2: ${comp.f2Similarity.toFixed(1)}%`,
+            );
+          }
+
+          // Include wav2vec2 phoneme analysis if available
+          const pa = (comp as any).phonemeAnalysis;
+          if (pa) {
+            lines.push(
+              ``,
+              `wav2vec2 Speech Recognition:`,
+              `  Model heard: "${pa.recognized}" (expected: "${target?.toUpperCase()}")`,
+            );
+            if (pa.charAccuracy) {
+              lines.push(
+                `  Character accuracy: ${pa.charAccuracy.similarity}%`,
+              );
+              // Show alignment issues
+              const issues = (pa.charAccuracy.alignment || [])
+                .filter((a: any) => a.status !== 'correct')
+                .slice(0, 5);
+              if (issues.length > 0) {
+                const issueStrs = issues.map((a: any) => {
+                  if (a.status === 'substitution') return `'${a.expected}'→'${a.recognized}'`;
+                  if (a.status === 'deletion') return `'${a.expected}' missing`;
+                  if (a.status === 'insertion') return `extra '${a.recognized}'`;
+                  return '';
+                }).filter(Boolean);
+                lines.push(`  Sound issues: ${issueStrs.join(', ')}`);
+              }
+            }
+          }
+
+          // Generate pronunciation tips based on detected problems
+          const tips: string[] = [];
+
+          // ── Adaptive tips based on practice history ──
+          let historyContext = '';
+          try {
+            const reprRes = await fetch(`http://localhost:3000/api/acoustic-representation?word=${encodeURIComponent(target || '')}`);
+            if (reprRes.ok) {
+              const reprData = await reprRes.json();
+              const wordRepr = reprData.words?.[target?.toLowerCase() || ''];
+              // ── Expose acoustic representation for UI visualization ──
+              if (wordRepr) {
+                setAcousticRepresentation(wordRepr);
+                dbg('praat', `🎨 Acoustic representation loaded for "${target}" (score: ${wordRepr.sound_impression_score}, attempts: ${wordRepr.total_attempts})`);
+              }
+              if (wordRepr && wordRepr.total_attempts >= 2) {
+                const dims = wordRepr.dimensions;
+                const attempts = wordRepr.total_attempts;
+                const trend = wordRepr.overall_trend;
+
+                // Overall trajectory
+                if (trend > 5) {
+                  historyContext = `📈 Improving trend: +${trend.toFixed(0)} points over ${attempts} attempts. Keep it up!`;
+                } else if (trend < -5) {
+                  historyContext = `📉 Declining trend: ${trend.toFixed(0)} points over ${attempts} attempts. Let's refocus.`;
+                } else if (attempts >= 5) {
+                  historyContext = `📊 Plateau at ${wordRepr.sound_impression_score}/100 over ${attempts} attempts. Try a different approach.`;
+                }
+
+                // Persistent problems (low score AND not improving)
+                const artic = dims.articulatory_accuracy;
+                if (artic && artic.score < 50 && artic.trend <= 0) {
+                  tips.push(`🔴 Persistent tongue/vowel issue (${attempts} attempts, not improving): This is your #1 area to focus on. Exaggerate your mouth movements.`);
+                } else if (artic && artic.score < 50 && artic.trend > 5) {
+                  tips.push(`🟢 Tongue position is improving (+${artic.trend.toFixed(0)} trend)! Keep focusing on vowel clarity.`);
+                }
+
+                const temporal = dims.temporal_control;
+                if (temporal && temporal.tendency === 'too_slow' && temporal.trend <= 0) {
+                  tips.push(`🟡 Consistently too slow (avg ${temporal.mean_ratio.toFixed(1)}x). Practice saying the word faster while keeping clarity.`);
+                } else if (temporal && temporal.score >= 80 && temporal.trend > 0) {
+                  tips.push(`🟢 Speed control has improved nicely — well done!`);
+                }
+
+                // Strengths to reinforce
+                const strengths = wordRepr.strengths || [];
+                if (strengths.length > 0 && wordRepr.sound_impression_score >= 50) {
+                  tips.push(`💪 Your strengths for this word: ${strengths.join(', ')}.`);
+                }
+
+                // Weaknesses to highlight
+                const weaknesses = wordRepr.weaknesses || [];
+                if (weaknesses.length > 0) {
+                  tips.push(`⚡ Priority areas: ${weaknesses.join(', ')}. Focus your attention here.`);
+                }
+              }
+            }
+          } catch (e) {
+            dbg('praat', '⚠️ Could not fetch acoustic representation for adaptive tips');
+          }
+
+          // Current-attempt problem-specific tips (only when scores are below thresholds)
+          if (comp.f2Similarity < 40) {
+            tips.push('🔴 Tongue position issue: Try moving your tongue slightly forward. Say "see" to feel the correct front position.');
+          } else if (comp.f2Similarity < 55) {
+            tips.push('🟡 Tongue position could improve: Focus on where your tongue sits for each vowel sound.');
+          }
+          if (comp.durationRatio > 2.5) {
+            tips.push('🟡 Speaking too slowly: Try connecting syllables without pausing between them.');
+          } else if (comp.durationRatio < 0.5) {
+            tips.push('🔴 Speaking too fast: Slow down and clearly pronounce each syllable.');
+          }
+          if (pa?.charAccuracy?.similarity != null && pa.charAccuracy.similarity < 50) {
+            tips.push('🔴 The word sounds quite different from expected. Break it into syllables and practice each part separately.');
+          }
+          if (comp.f1Similarity < 40) {
+            tips.push('🟡 Mouth opening issue: Pay attention to how wide you open your mouth for each vowel.');
+          }
+
+          if (tips.length > 0 || historyContext) {
+            lines.push('', 'Pronunciation tips to share with learner:');
+            if (historyContext) lines.push(`  ${historyContext}`);
+            tips.forEach(t => lines.push(`  ${t}`));
+          }
         }
         lines.push(
           '',
-          'INSTRUCTIONS: Give brief data-driven pronunciation feedback (1-2 sentences). Cite specific scores.',
+          'INSTRUCTIONS: Give brief data-driven pronunciation feedback (2-3 sentences). Cite specific scores. If there are pronunciation tips above, share the most relevant one naturally. If there is a history trend, mention it briefly.',
           'IMPORTANT: Do NOT restart the pronunciation drill or ask them to repeat the word again. Continue naturally from wherever the conversation currently is.',
           'If you already moved on (e.g., asked for a sentence), keep that flow — just briefly mention the score, then continue with what you were doing.',
-          'Example: "By the way, your pronunciation scored 65% — your vowels were good but the pace was a bit slow. Now, back to your sentence..."',
+          'Example: "Your pronunciation scored 65% — your vowels improved from last time! For hypothesis, remember the \'th\' needs your tongue between your teeth: hy-POTH-e-sis."',
         );
 
         if (sessionRef.current) {
@@ -548,6 +693,10 @@ export function useLiveAPI() {
                 dbgUpdateState({ aiTurnActive: true });
                 dbg('flow', `═══ AI TURN START ═══ target="${targetWordRef.current}" skipAnalysis=${skipNextAnalysisRef.current} isPraatResp=${isPraatResponseRef.current}`);
                 if (extractTimerRef.current) { clearTimeout(extractTimerRef.current); extractTimerRef.current = null; }
+
+                // Stop recording countdown when AI starts speaking
+                if (recordingTimerRef.current) { clearInterval(recordingTimerRef.current); recordingTimerRef.current = null; }
+                setRecordingSecondsLeft(null);
 
                 // Cancel any pending debounce — AI speaking means user is done
                 if (praatDebounceRef.current) {
@@ -692,6 +841,21 @@ export function useLiveAPI() {
               setIsSpeaking(false);
               aiTurnActiveRef.current = false;
               dbgUpdateState({ aiTurnActive: false });
+
+              // Start recording countdown when AI finishes and there's a target word
+              if (targetWordRef.current && !isPraatResponseRef.current) {
+                recordingDeadlineRef.current = Date.now() + RECORDING_TIME_LIMIT * 1000;
+                setRecordingSecondsLeft(RECORDING_TIME_LIMIT);
+                if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+                recordingTimerRef.current = setInterval(() => {
+                  const left = Math.max(0, Math.ceil((recordingDeadlineRef.current - Date.now()) / 1000));
+                  setRecordingSecondsLeft(left);
+                  if (left <= 0) {
+                    clearInterval(recordingTimerRef.current!);
+                    recordingTimerRef.current = null;
+                  }
+                }, 200);
+              }
 
               if (isEmptyTurn) {
                 // The AI didn't output audio this turn. 
@@ -897,6 +1061,7 @@ export function useLiveAPI() {
   return {
     isConnected, isListening, isSpeaking, volume, transcript, error,
     pronunciationScore, isAnalyzing, currentTargetWord, recognizedSpeech, speechMismatch,
+    acousticRepresentation, recordingSecondsLeft,
     connect, disconnect, setBuffering, pauseAI, resumeAI,
   };
 }
