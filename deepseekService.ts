@@ -1,27 +1,16 @@
 /**
- * DeepSeek Chat Service
- * =====================
- * Provides LLM chat completion using DeepSeek API (OpenAI-compatible).
- * Supports streaming responses for real-time feedback.
+ * DeepSeek Chat Service (via GitCode)
+ * ====================================
+ * Uses raw fetch to handle GitCode's always-streaming API format.
  */
-import OpenAI from 'openai';
 
-const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+const LLM_BASE_URL = process.env.LLM_BASE_URL || 'https://api-ai.gitcode.com/v1';
+const LLM_MODEL = process.env.LLM_MODEL || 'deepseek-v3.1';
 
-let client: OpenAI | null = null;
-
-function getClient(): OpenAI {
-  if (!client) {
-    const apiKey = process.env.DEEPSEEK_API_KEY;
-    if (!apiKey) {
-      throw new Error('DEEPSEEK_API_KEY environment variable is required');
-    }
-    client = new OpenAI({
-      baseURL: DEEPSEEK_BASE_URL,
-      apiKey,
-    });
-  }
-  return client;
+function getApiKey(): string {
+  const key = process.env.LLM_API_KEY || process.env.DEEPSEEK_API_KEY;
+  if (!key) throw new Error('LLM_API_KEY or DEEPSEEK_API_KEY environment variable is required');
+  return key;
 }
 
 export interface ChatMessage {
@@ -30,7 +19,32 @@ export interface ChatMessage {
 }
 
 /**
- * Send a chat completion request to DeepSeek.
+ * Parse SSE streaming response from GitCode's DeepSeek API.
+ * Collects all text chunks and returns the full response.
+ */
+async function parseSSEResponse(response: Response): Promise<string> {
+  const text = await response.text();
+  let fullContent = '';
+  
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    
+    const jsonStr = trimmed.slice(5).trim();
+    if (jsonStr === '[DONE]') break;
+    
+    try {
+      const parsed = JSON.parse(jsonStr);
+      const delta = parsed.choices?.[0]?.delta?.content || '';
+      if (delta) fullContent += delta;
+    } catch {}
+  }
+  
+  return fullContent;
+}
+
+/**
+ * Send a chat completion request to DeepSeek via GitCode.
  * Returns the full response text.
  */
 export async function chatCompletion(
@@ -41,25 +55,38 @@ export async function chatCompletion(
     maxTokens?: number;
   }
 ): Promise<string> {
-  const ai = getClient();
-  const model = options?.model || 'deepseek-chat';
+  const model = options?.model || LLM_MODEL;
+  const apiKey = getApiKey();
   
-  console.log(`[DeepSeek] Sending ${messages.length} messages to ${model}...`);
+  console.log(`[LLM] Sending ${messages.length} messages to ${model} via ${LLM_BASE_URL}...`);
   
-  const response = await ai.chat.completions.create({
-    model,
-    messages,
-    temperature: options?.temperature ?? 0.7,
-    max_tokens: options?.maxTokens ?? 512,
+  const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: options?.temperature ?? 0.7,
+      max_tokens: options?.maxTokens ?? 512,
+      stream: true,
+    }),
   });
 
-  const text = response.choices[0]?.message?.content || '';
-  console.log(`[DeepSeek] Response: "${text.substring(0, 80)}..." (${text.length} chars)`);
-  return text;
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`LLM API error (${response.status}): ${errText.substring(0, 200)}`);
+  }
+
+  const fullText = await parseSSEResponse(response);
+  console.log(`[LLM] Response: "${fullText.substring(0, 80)}..." (${fullText.length} chars)`);
+  return fullText;
 }
 
 /**
- * Send a streaming chat completion request to DeepSeek.
+ * Send a streaming chat completion request.
  * Calls onChunk for each text chunk received.
  * Returns the full accumulated text.
  */
@@ -72,28 +99,51 @@ export async function chatCompletionStream(
     maxTokens?: number;
   }
 ): Promise<string> {
-  const ai = getClient();
-  const model = options?.model || 'deepseek-chat';
+  const model = options?.model || LLM_MODEL;
+  const apiKey = getApiKey();
   
-  console.log(`[DeepSeek] Streaming ${messages.length} messages to ${model}...`);
+  console.log(`[LLM] Streaming ${messages.length} messages to ${model}...`);
   
-  const stream = await ai.chat.completions.create({
-    model,
-    messages,
-    temperature: options?.temperature ?? 0.7,
-    max_tokens: options?.maxTokens ?? 512,
-    stream: true,
+  const response = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      temperature: options?.temperature ?? 0.7,
+      max_tokens: options?.maxTokens ?? 512,
+      stream: true,
+    }),
   });
 
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`LLM API error (${response.status}): ${errText.substring(0, 200)}`);
+  }
+
+  // Parse streaming response line by line
+  const text = await response.text();
   let fullText = '';
-  for await (const chunk of stream) {
-    const delta = chunk.choices[0]?.delta?.content || '';
-    if (delta) {
-      fullText += delta;
-      onChunk(delta);
-    }
+  
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const jsonStr = trimmed.slice(5).trim();
+    if (jsonStr === '[DONE]') break;
+    
+    try {
+      const parsed = JSON.parse(jsonStr);
+      const delta = parsed.choices?.[0]?.delta?.content || '';
+      if (delta) {
+        fullText += delta;
+        onChunk(delta);
+      }
+    } catch {}
   }
   
-  console.log(`[DeepSeek] Stream complete: "${fullText.substring(0, 80)}..." (${fullText.length} chars)`);
+  console.log(`[LLM] Stream complete: "${fullText.substring(0, 80)}..." (${fullText.length} chars)`);
   return fullText;
 }
