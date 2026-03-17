@@ -179,7 +179,7 @@ export function useWebSocketAPI() {
                   // Send to backend for STT/AI
                   ws.send(JSON.stringify({ type: 'audio', data: base64Chunk }));
                   // Also buffer locally for Praat
-                  if (processorRef.current?.isBufferingConfigured) {
+                  if (processorRef.current?.getIsBuffering()) {
                     userFullBufferRef.current.push(base64Chunk);
                   }
                 }
@@ -268,7 +268,7 @@ export function useWebSocketAPI() {
 
       // Periodic silence detector for WS events (since we don't have Gemini's native event)
       silenceTimerRef.current = setInterval(() => {
-         if (processorRef.current && processorRef.current.isBufferingConfigured && !isPlayingRef.current) {
+         if (processorRef.current && processorRef.current.getIsBuffering() && !isPlayingRef.current) {
            const db = processorRef.current.getCurrentVolume();
            // if volume is very low, let's assume they stopped singing/speaking
            // and tell backend to process what we sent!

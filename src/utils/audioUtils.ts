@@ -22,6 +22,7 @@ export class AudioProcessor {
   private userBuffer: string[] = [];
   private aiBuffer: string[] = [];
   private peakChunks = 0;
+  private currentDb = 0;
   private onBufferUpdate?: (stats: { chunks: number; memoryKB: number; durationSec: number; peak: number }) => void;
 
   async startRecording(onChunk: (base64: string) => void) {
@@ -38,6 +39,13 @@ export class AudioProcessor {
       if (this.isMuted) return;
 
       const float32 = e.inputBuffer.getChannelData(0);
+      
+      // Calculate simple volume (dB-like) for silence detection
+      let sumSq = 0;
+      for (let i = 0; i < float32.length; i++) sumSq += float32[i] * float32[i];
+      const rms = Math.sqrt(sumSq / float32.length);
+      this.currentDb = rms * 100;
+
       const pcm16 = this.float32ToPCM16(float32);
       const base64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)));
 
@@ -69,6 +77,7 @@ export class AudioProcessor {
   setMuted(muted: boolean) { this.isMuted = muted; }
   hasUserAudio(): boolean { return this.userBuffer.length > 0; }
   getUserChunkCount(): number { return this.userBuffer.length; }
+  getCurrentVolume(): number { return this.currentDb; }
   clearUserBuffer() { this.userBuffer = []; }
   flushUserBuffer(): string[] { const b = [...this.userBuffer]; this.userBuffer = []; return b; }
 
@@ -115,10 +124,62 @@ export class AudioPlayer {
   private ctx: AudioContext;
   private nextTime = 0;
   private onVolume?: (v: number) => void;
+  private onCompleteCb?: () => void;
+  private checkInterval?: NodeJS.Timeout;
 
   constructor(onVolume?: (v: number) => void) {
     this.ctx = new AudioContext({ sampleRate: 24000 });
     this.onVolume = onVolume;
+  }
+
+  startStreaming() {
+    this.nextTime = this.ctx.currentTime > 0 ? this.ctx.currentTime + 0.1 : 0.1;
+  }
+
+  addPCMBuffer(base64: string, sampleRate: number = 24000) {
+    const pcm = this.decodePCM16(base64);
+
+    let sum = 0;
+    for (let i = 0; i < pcm.length; i++) sum += Math.abs(pcm[i]);
+    this.onVolume?.(sum / pcm.length);
+
+    // Dynamic resample if needed
+    const actualCtxRate = this.ctx.sampleRate || 24000;
+    const buf = this.ctx.createBuffer(1, pcm.length, sampleRate);
+    buf.getChannelData(0).set(pcm);
+    
+    // Play with scheduled time
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.ctx.destination);
+
+    const now = this.ctx.currentTime;
+    // Keep a slight buffer to avoid clicking/gaps
+    if (this.nextTime < now + 0.05) this.nextTime = now + 0.05;
+    
+    src.start(this.nextTime);
+    this.nextTime += buf.duration;
+
+    setTimeout(() => {
+      if (this.nextTime <= this.ctx.currentTime + 0.1) this.onVolume?.(0);
+    }, buf.duration * 1000 + 150);
+  }
+
+  onComplete(cb: () => void) {
+    this.onCompleteCb = cb;
+  }
+
+  flushAndFinish() {
+    if (this.checkInterval) clearInterval(this.checkInterval);
+    
+    this.checkInterval = setInterval(() => {
+      // If we've passed the scheduled end time
+      if (this.ctx.currentTime >= this.nextTime) {
+        if (this.checkInterval) clearInterval(this.checkInterval);
+        this.onVolume?.(0);
+        if (this.onCompleteCb) this.onCompleteCb();
+      }
+    }, 100);
   }
 
   play(base64: string) {
@@ -149,6 +210,7 @@ export class AudioPlayer {
     this.ctx = new AudioContext({ sampleRate: 24000 });
     this.nextTime = 0;
     this.onVolume?.(0);
+    if (this.checkInterval) clearInterval(this.checkInterval);
   }
 
   /** Suspend playback (pauses all scheduled audio) */
