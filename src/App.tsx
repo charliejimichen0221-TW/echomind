@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Mic, MicOff, Send, MessageSquare, Shield, Zap, Info, History, X, User, Headphones, BookOpen, CheckCircle2, Award, Activity, BarChart3, Volume2, AudioLines, Play, Square } from 'lucide-react';
 import { useLiveAPI } from './hooks/useLiveAPI';
+import { useWebSocketAPI } from './hooks/useWebSocketAPI';
 import { AudioVisualizer } from './components/AudioVisualizer';
 import { TalkingHead } from './components/TalkingHead';
 import { AcousticAura } from './components/AcousticAura';
@@ -17,7 +18,14 @@ const TRAINING_LEVELS = [
 ];
 
 export default function App() {
-  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord, recognizedSpeech, speechMismatch, acousticRepresentation, recordingSecondsLeft, pauseAI, resumeAI } = useLiveAPI();
+  const [useChinaMode, setUseChinaMode] = useState(false);
+
+  // Get active hook based on toggle
+  const geminiAPI = useLiveAPI();
+  const wsAPI = useWebSocketAPI();
+  const api = useChinaMode ? wsAPI : geminiAPI;
+  
+  const { isConnected, isSpeaking, volume, transcript, error, connect, disconnect, pronunciationScore, isAnalyzing, currentTargetWord, recognizedSpeech, speechMismatch, acousticRepresentation, recordingSecondsLeft, pauseAI, resumeAI } = api;
   const [selectedLevel, setSelectedLevel] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const [debaterImage, setDebaterImage] = useState<string | null>(null);
