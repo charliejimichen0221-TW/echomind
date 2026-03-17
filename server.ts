@@ -12,6 +12,7 @@ dotenv.config({ path: '.env.local' });
 dotenv.config();
 
 import { analyzePronunciation, comparePronunciation } from './praatService.js';
+import { setupWebSocketChat } from './wsChat.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -509,8 +510,12 @@ async function startServer() {
     });
   }
 
+  // Attach WebSocket chat handler (DeepSeek + Edge TTS)
+  setupWebSocketChat(httpServer);
+
   httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`EchoMind Server running on http://localhost:${PORT}`);
+    console.log(`WebSocket chat available at ws://localhost:${PORT}/ws/chat`);
   });
 }
 

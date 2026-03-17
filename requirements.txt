@@ -24,3 +24,6 @@ scikit-learn>=1.5
 
 # HTTP requests
 requests>=2.32
+
+# TTS (China edition)
+edge-tts>=6.1
